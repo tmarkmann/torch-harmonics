@@ -171,10 +171,10 @@ def trapezoidal_weights(n: int, a: Optional[float] = -1.0, b: Optional[float] = 
     return xlg, wlg
 
 
-def geometric_weights(n: int, a: Optional[float] = 1.0, b: Optional[float] = math.e) -> Tuple[torch.Tensor, torch.Tensor]:
+def geometric_weights(n: int, a: Optional[float] = 1.0, b: Optional[float] = math.e, periodic: Optional[bool] = False) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Helper routine which returns geometrically spaced nodes, uniform in log(x), together
-    with the corresponding trapezoidal weights for the integral over dv on [a, b]
+    with the corresponding trapezoidal weights for the integral over dx on [a, b]
 
     Parameters
     -----------
@@ -184,6 +184,8 @@ def geometric_weights(n: int, a: Optional[float] = 1.0, b: Optional[float] = mat
         Lower bound of the interval
     b: Optional[float]
         Upper bound of the interval
+    periodic: Optional[bool]
+        Whether the grid is periodic in log(x)
 
     Returns
     -------
@@ -196,7 +198,7 @@ def geometric_weights(n: int, a: Optional[float] = 1.0, b: Optional[float] = mat
     if a <= 0.0:
         raise ValueError(f"lower bound of a geometric grid must be positive, got {a}")
 
-    xlg, wlg = trapezoidal_weights(n, math.log(a), math.log(b))
+    xlg, wlg = trapezoidal_weights(n, math.log(a), math.log(b), periodic=periodic)
     vlg = torch.exp(xlg)
 
     return vlg, vlg * wlg
