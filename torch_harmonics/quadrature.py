@@ -137,6 +137,67 @@ def precompute_latitudes(nlat: int, grid: Optional[str] = "equiangular") -> Tupl
     return lats, wlg
 
 
+@lru_cache(typed=True, copy=True)
+def precompute_radii(
+    nr: int, vmin: float, vmax: float, domain: str = "half-line", R: Optional[float] = None, periodic: bool = False, dtype: torch.dtype = torch.float64
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Radial grid and quadrature weights.
+
+    Parameters
+    -----------
+    nr : int
+        Number of radial nodes
+    vmin : float
+        Lower bound on r, or on rho / R = (r - R) / R for the exterior domain
+    vmax : float
+        Upper bound
+    domain : str, optional
+        Either "half-line" or "exterior", by default "half-line"
+    R : float, optional
+        Inner radius, required for domain="exterior", by default None
+    periodic : bool, optional
+        Whether to weight the nodes as one period of a periodic signal, by default False.
+        This selects the weights only, never the nodes: both endpoints always lie on the
+        grid, so callers passing the same bounds always sample the same radii. The closed
+        rule halves the weight at each end and integrates over ``[vmin, vmax]``; the
+        periodic rule weights every node equally, which treats the ``nr`` samples as one
+        period of length ``nr * h`` in ``log``, the wrap point being the node that would
+        follow ``vmax``. Quadrature over ``dr`` wants the closed rule, a DFT in ``log r``
+        wants the periodic one.
+    dtype : torch.dtype, optional
+        Floating point type, by default torch.float64
+
+    Returns
+    -------
+    x : torch.Tensor
+        Reduced coordinate of the nodes
+    r : torch.Tensor
+        Radial nodes
+    w : torch.Tensor
+        Trapezoidal weights for the integral over dr
+    """
+
+    if domain == "half-line":
+        r, w = geometric_weights(nr, vmin, vmax)
+        x = torch.log(r)
+    elif domain == "exterior":
+        if R is None:
+            raise ValueError("R must be given for domain='exterior'")
+        rho, wrho = geometric_weights(nr, vmin, vmax)
+        x, r, w = torch.log(rho), R + R * rho, R * wrho
+    else:
+        raise ValueError(f"unknown domain: {domain}")
+
+    if periodic:
+        # undo the half weights the closed rule puts at the ends
+        w = w.clone()
+        w[0] *= 2.0
+        w[-1] *= 2.0
+
+    return x.to(dtype), r.to(dtype), w.to(dtype)
+
+
 def trapezoidal_weights(n: int, a: Optional[float] = -1.0, b: Optional[float] = 1.0, periodic: Optional[bool] = False) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Helper routine which returns equiangular-trapezoidal nodes with trapezoidal weights

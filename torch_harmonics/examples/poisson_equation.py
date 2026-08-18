@@ -37,52 +37,7 @@ import torch
 import torch.nn as nn
 
 import torch_harmonics as th
-from torch_harmonics.quadrature import geometric_weights, precompute_latitudes, precompute_longitudes
-
-
-def radial_grid(
-    nr: int, vmin: float, vmax: float, grid: str = "half-line", R: Optional[float] = None, dtype: torch.dtype = torch.float64
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Radial grid and quadrature weights.
-
-    Parameters
-    -----------
-    nr : int
-        Number of radial nodes
-    vmin : float
-        Lower bound on r, or on rho / R = (r - R) / R for the exterior domain
-    vmax : float
-        Upper bound
-    grid : str, optional
-        Either "half-line" or "exterior", by default "half-line"
-    R : float, optional
-        Inner radius, required for domain="exterior", by default None
-    dtype : torch.dtype, optional
-        Floating point type, by default torch.float64
-
-    Returns
-    -------
-    x : torch.Tensor
-        Reduced coordinate of the nodes
-    r : torch.Tensor
-        Radial nodes
-    w : torch.Tensor
-        Trapezoidal weights for the integral over dr
-    """
-
-    if grid == "half-line":
-        r, w = geometric_weights(nr, vmin, vmax)
-        x = torch.log(r)
-    elif grid == "exterior":
-        if R is None:
-            raise ValueError("R must be given for grid='exterior'")
-        rho, wrho = geometric_weights(nr, vmin, vmax)
-        x, r, w = torch.log(rho), R + R * rho, R * wrho
-    else:
-        raise ValueError(f"unknown grid: {grid}")
-
-    return x.to(dtype), r.to(dtype), w.to(dtype)
+from torch_harmonics.quadrature import precompute_latitudes, precompute_longitudes, precompute_radii
 
 
 class GreensOperator(nn.Module):
@@ -236,7 +191,7 @@ class RadialPoissonSolver(nn.Module):
         self.rmin = defaults[0] if rmin is None else rmin
         self.rmax = defaults[1] if rmax is None else rmax
 
-        x, r, w = radial_grid(nr, self.rmin, self.rmax, grid=domain, R=R)
+        x, r, w = precompute_radii(nr, self.rmin, self.rmax, domain=domain, R=R)
         self.radial = GreensOperator(r, w, self.lmax, domain=domain, R=R)
 
         # register all
