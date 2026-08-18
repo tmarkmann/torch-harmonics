@@ -181,11 +181,11 @@ class RadialPoissonSolver(nn.Module):
         Number of longitude points
     nr : int
         Number of radial points
-    r_min, r_max : float, optional
+    rmin, rmax : float, optional
         Bounds of the radial grid. On the half-line these are bounds on r itself, by
         default (1e-1, 1e3). On the exterior domain they are bounds on the reduced
         coordinate rho / R = (r - R) / R, by default (1e-2, 1e2), so that r ranges over
-        R * (1 + r_min) to R * (1 + r_max).
+        R * (1 + rmin) to R * (1 + rmax).
     lmax : int, optional
         Maximum l mode, by default None
     mmax : int, optional
@@ -198,7 +198,7 @@ class RadialPoissonSolver(nn.Module):
         Inner radius for exterior domain, by default None
     """
 
-    def __init__(self, nlat, nlon, nr, r_min=None, r_max=None, lmax=None, mmax=None, grid="legendre-gauss", domain="half-line", R=None):
+    def __init__(self, nlat, nlon, nr, rmin=None, rmax=None, lmax=None, mmax=None, grid="legendre-gauss", domain="half-line", R=None):
         super().__init__()
 
         # grid parameters
@@ -233,10 +233,10 @@ class RadialPoissonSolver(nn.Module):
         else:
             raise ValueError(f"unknown domain: {domain}")
 
-        self.r_min = defaults[0] if r_min is None else r_min
-        self.r_max = defaults[1] if r_max is None else r_max
+        self.rmin = defaults[0] if rmin is None else rmin
+        self.rmax = defaults[1] if rmax is None else rmax
 
-        x, r, w = radial_grid(nr, self.r_min, self.r_max, grid=domain, R=R)
+        x, r, w = radial_grid(nr, self.rmin, self.rmax, grid=domain, R=R)
         self.radial = GreensOperator(r, w, self.lmax, domain=domain, R=R)
 
         # register all
