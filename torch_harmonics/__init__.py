@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - source tree that was never built
 from . import examples, quadrature, random_fields
 from .attention import AttentionS2, NeighborhoodAttentionS2
 from .disco import DiscreteContinuousConvS2, DiscreteContinuousConvTransposeS2
-from .mellin import InverseRealMellinTransform, RealMellinTransform
+from .mellin import InverseMellinTransform, InverseRealMellinTransform, MellinTransform, RealMellinTransform, SpectralConvRadialS2
 from .quadrature import QuadratureS2
 from .resample import ResampleS2
 from .sht import InverseRealSHT, InverseRealVectorSHT, RealSHT, RealVectorSHT
