@@ -36,56 +36,9 @@ import torch
 import torch.nn as nn
 
 from torch_harmonics.fft import _pad_dim_right, irfft, rfft
-from torch_harmonics.quadrature import QuadratureS2, geometric_weights
+from torch_harmonics.quadrature import QuadratureS2, precompute_radii
 from torch_harmonics.sht import InverseRealSHT, RealSHT
 from torch_harmonics.truncation import truncate_sht
-
-
-def radial_grid(
-    nr: int, vmin: float, vmax: float, domain: str = "half-line", R: Optional[float] = None, periodic: bool = True, dtype: torch.dtype = torch.float64
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Radial grid and quadrature weights.
-
-    Parameters
-    -----------
-    nr : int
-        Number of radial nodes
-    vmin : float
-        Lower bound on r, or on rho / R = (r - R) / R for the exterior domain
-    vmax : float
-        Upper bound
-    domain : str, optional
-        Either "half-line" or "exterior", by default "half-line"
-    R : float, optional
-        Inner radius, required for domain="exterior", by default None
-    periodic : bool, optional
-        Whether the grid is periodic, by default True
-    dtype : torch.dtype, optional
-        Floating point type, by default torch.float64
-
-    Returns
-    -------
-    x : torch.Tensor
-        Reduced coordinate of the nodes
-    r : torch.Tensor
-        Radial nodes
-    w : torch.Tensor
-        Trapezoidal weights for the integral over dr
-    """
-
-    if domain == "half-line":
-        r, w = geometric_weights(nr, vmin, vmax, periodic=periodic)
-        x = torch.log(r)
-    elif domain == "exterior":
-        if R is None:
-            raise ValueError("R must be given for domain='exterior'")
-        rho, wrho = geometric_weights(nr, vmin, vmax, periodic=periodic)
-        x, r, w = torch.log(rho), R + R * rho, R * wrho
-    else:
-        raise ValueError(f"unknown domain: {domain}")
-
-    return x.to(dtype), r.to(dtype), w.to(dtype)
 
 
 class RealMellinTransform(nn.Module):
@@ -122,7 +75,7 @@ class RealMellinTransform(nn.Module):
         self.npad = npad
 
         # geometric radial grid
-        x, r, w = radial_grid(nr, r_min, r_max, domain=domain, R=R, periodic=True)
+        x, r, w = precompute_radii(nr, r_min, r_max, domain=domain, R=R, periodic=True)
 
         # log-grid spacing dx = dr/r
         self.h = (x[-1] - x[0]).item() / (nr - 1)
@@ -194,7 +147,7 @@ class InverseRealMellinTransform(nn.Module):
         self.dim = dim
         self.npad = npad
 
-        x, r, w = radial_grid(nr, r_min, r_max, domain=domain, R=R, periodic=True)
+        x, r, w = precompute_radii(nr, r_min, r_max, domain=domain, R=R, periodic=True)
 
         self.h = (x[-1] - x[0]).item() / (nr - 1)
         self.ntot = nr + npad
@@ -285,7 +238,7 @@ class MellinTransform(nn.Module):
         self.npad = npad
 
         # geometric radial grid
-        x, r, w = radial_grid(nr, r_min, r_max, domain=domain, R=R, periodic=True)
+        x, r, w = precompute_radii(nr, r_min, r_max, domain=domain, R=R, periodic=True)
 
         # log-grid spacing dx = dr/r
         self.h = (x[-1] - x[0]).item() / (nr - 1)
@@ -362,7 +315,7 @@ class InverseMellinTransform(nn.Module):
         self.dim = dim
         self.npad = npad
 
-        x, r, w = radial_grid(nr, r_min, r_max, domain=domain, R=R, periodic=True)
+        x, r, w = precompute_radii(nr, r_min, r_max, domain=domain, R=R, periodic=True)
 
         self.h = (x[-1] - x[0]).item() / (nr - 1)
         self.ntot = nr + npad
