@@ -48,6 +48,9 @@ class PoissonDataset(torch.utils.data.Dataset):
         Either "half-line" or "exterior", by default "half-line"
     R : float, optional
         Inner radius for exterior domain, by default None
+    rmin, rmax : float, optional
+        Radial bounds, or bounds on ``rho / R = (r - R) / R`` for the exterior domain. By
+        default the solver's own
     nblobs : int or tuple of int, optional
         Number of blobs in each source, by default (1, 8)
     l_src : int, optional
@@ -75,6 +78,8 @@ class PoissonDataset(torch.utils.data.Dataset):
         grid="legendre-gauss",
         domain="half-line",
         R=None,
+        rmin=None,
+        rmax=None,
         nblobs=(1, 8),
         l_src=8,
         positive=False,
@@ -94,6 +99,8 @@ class PoissonDataset(torch.utils.data.Dataset):
             self.nlat,
             self.nlon,
             self.nr,
+            rmin=rmin,
+            rmax=rmax,
             grid=grid,
             domain=domain,
             R=R,

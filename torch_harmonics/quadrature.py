@@ -137,6 +137,7 @@ def precompute_latitudes(nlat: int, grid: Optional[str] = "equiangular") -> Tupl
     return lats, wlg
 
 
+# TODO R -> inner_radius ; n_radius
 @lru_cache(typed=True, copy=True)
 def precompute_radii(
     nr: int, vmin: float, vmax: float, domain: str = "half-line", R: Optional[float] = None, periodic: bool = False, dtype: torch.dtype = torch.float64
@@ -157,14 +158,7 @@ def precompute_radii(
     R : float, optional
         Inner radius, required for domain="exterior", by default None
     periodic : bool, optional
-        Whether to weight the nodes as one period of a periodic signal, by default False.
-        This selects the weights only, never the nodes: both endpoints always lie on the
-        grid, so callers passing the same bounds always sample the same radii. The closed
-        rule halves the weight at each end and integrates over ``[vmin, vmax]``; the
-        periodic rule weights every node equally, which treats the ``nr`` samples as one
-        period of length ``nr * h`` in ``log``, the wrap point being the node that would
-        follow ``vmax``. Quadrature over ``dr`` wants the closed rule, a DFT in ``log r``
-        wants the periodic one.
+        Whether to weight the nodes as one period of a periodic signal, by default False
     dtype : torch.dtype, optional
         Floating point type, by default torch.float64
 
