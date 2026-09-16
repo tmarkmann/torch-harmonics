@@ -138,6 +138,7 @@ def precompute_latitudes(nlat: int, grid: Optional[str] = "equiangular") -> Tupl
     return lats, wlg
 
 
+# TODO R -> inner_radius ; n_radius
 @lru_cache(typed=True, copy=True)
 def precompute_radii(
     nr: int, vmin: float, vmax: float, domain: str = "half-line", inner_radius: Optional[float] = None, dtype: torch.dtype = torch.float64
