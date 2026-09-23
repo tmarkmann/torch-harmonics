@@ -38,6 +38,7 @@ import torch.nn as nn
 
 import torch_harmonics as th
 from torch_harmonics.quadrature import precompute_latitudes, precompute_longitudes, precompute_radii
+from torch_harmonics.random_fields import GaussianRandomFieldRadialS2
 
 
 class GreensOperator(nn.Module):
