@@ -41,6 +41,41 @@ from torch_harmonics.sht import InverseRealSHT, RealSHT
 from torch_harmonics.truncation import truncate_sht
 
 
+# real dtypes with a complex counterpart; bfloat16 deliberately absent
+_COMPLEX_FOR_REAL = {torch.float16: torch.complex32, torch.float32: torch.complex64, torch.float64: torch.complex128}
+
+
+def _keep_complex(fn):
+    """
+    Wrap an ``_apply`` function so complex tensors land on a complex dtype.
+
+    ``Module.to(dtype=<real dtype>)`` casts a complex tensor to that real dtype, discarding
+    the imaginary part. For the Mellin log-origin phase that is silent: ``forward`` restores
+    complexity with ``weights.to(x.dtype)``, so the unit-modulus phase simply reappears as
+    ``cos(omega * x0)`` and colours the spectrum. For the spectral weights it is loud, and the
+    contraction fails on a dtype mismatch. Requesting a real dtype is read here as a request
+    for the matching precision, so complex128 becomes complex64 under ``.to(torch.float32)``.
+    A real dtype with no complex counterpart leaves the dtype alone rather than corrupting it.
+    """
+
+    def apply(t):
+        if not t.is_complex():
+            return fn(t)
+
+        # a zero-element probe reveals the target device and dtype without a full copy
+        probe = fn(t.new_empty(0))
+        if probe.is_complex():
+            return fn(t)
+
+        target = _COMPLEX_FOR_REAL.get(probe.dtype)
+        if target is None:
+            return t.to(device=probe.device)
+
+        return t.to(device=probe.device, dtype=target)
+
+    return apply
+
+
 class RealMellinTransform(nn.Module):
     r"""
     Defines a module for computing the forward (real-valued) Mellin transform.
@@ -96,6 +131,9 @@ class RealMellinTransform(nn.Module):
 
     def extra_repr(self):
         return f"nr={self.nr}, wmax={self.wmax},\n domain={self.domain}, R={self.R},\n dim={self.dim}, npad={self.npad}"
+
+    def _apply(self, fn, *args, **kwargs):
+        return super()._apply(_keep_complex(fn), *args, **kwargs)
 
     def forward(self, x: torch.Tensor):
         """
@@ -166,6 +204,9 @@ class InverseRealMellinTransform(nn.Module):
 
     def extra_repr(self):
         return f"nr={self.nr}, wmax={self.wmax},\n domain={self.domain}, R={self.R},\n dim={self.dim}, npad={self.npad}"
+
+    def _apply(self, fn, *args, **kwargs):
+        return super()._apply(_keep_complex(fn), *args, **kwargs)
 
     def forward(self, x: torch.Tensor):
         """
@@ -261,6 +302,9 @@ class MellinTransform(nn.Module):
     def extra_repr(self):
         return f"nr={self.nr}, wmax={self.wmax},\n domain={self.domain}, R={self.R},\n dim={self.dim}, npad={self.npad}"
 
+    def _apply(self, fn, *args, **kwargs):
+        return super()._apply(_keep_complex(fn), *args, **kwargs)
+
     def forward(self, x: torch.Tensor):
         """
         Compute the forward (complex) Mellin transform.
@@ -335,6 +379,9 @@ class InverseMellinTransform(nn.Module):
 
     def extra_repr(self):
         return f"nr={self.nr}, wmax={self.wmax},\n domain={self.domain}, R={self.R},\n dim={self.dim}, npad={self.npad}"
+
+    def _apply(self, fn, *args, **kwargs):
+        return super()._apply(_keep_complex(fn), *args, **kwargs)
 
     def forward(self, x: torch.Tensor):
         """
@@ -481,6 +528,9 @@ class SpectralConvRadialS2(nn.Module):
 
     def extra_repr(self):
         return f"in_channels={self.in_channels}, out_channels={self.out_channels},\n lmax={self.lmax}, mmax={self.mmax}, nw={self.nw},\n num_groups={self.num_groups}"
+
+    def _apply(self, fn, *args, **kwargs):
+        return super()._apply(_keep_complex(fn), *args, **kwargs)
 
     @torch.compile
     def _contract_diagonal(self, ac: torch.Tensor, bc: torch.Tensor) -> torch.Tensor:

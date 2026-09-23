@@ -112,7 +112,7 @@ class PoissonDataset(torch.utils.data.Dataset):
     def _get_sample(self):
         """Get one unscaled source + solution pair."""
 
-        f = self.solver.random_source(nblobs=self.nblobs, l_src=self.l_src, positive=self.positive)
+        f = self.solver.random_bump_source(nblobs=self.nblobs, l_src=self.l_src, positive=self.positive)
         u = self.solver.solve(f)
 
         return f.float(), u.float()

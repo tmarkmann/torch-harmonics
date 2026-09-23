@@ -38,6 +38,7 @@ import torch.nn as nn
 
 import torch_harmonics as th
 from torch_harmonics.quadrature import precompute_latitudes, precompute_longitudes, precompute_radii
+from torch_harmonics.random_fields import GaussianRandomFieldRadialS2
 
 
 class GreensOperator(nn.Module):
@@ -249,7 +250,19 @@ class RadialPoissonSolver(nn.Module):
 
         return aspec
 
-    def random_source(self, nblobs=(1, 8), l_src=8, decay=1.0, margin=None, width=(0.03, 0.10), positive=False) -> torch.Tensor:
+    def ball_source(self, radius=1.0, value=1.0) -> torch.Tensor:
+        """Source for the Poisson equation on a ball of radius `radius` and value `value`."""
+
+        if self.domain != "half-line":
+            raise ValueError("ball_source is only defined on the half-line domain")
+        if not (self.rmin < radius < self.rmax):
+            raise ValueError(f"radius {radius} must lie strictly inside [{self.rmin}, {self.rmax}]")
+
+        f = torch.zeros(self.nr, self.nlat, self.nlon, dtype=self.r.dtype, device=self.r.device)
+        f[self.r <= radius] = value
+        return f
+    
+    def random_bump_source(self, nblobs=(1, 8), l_src=8, decay=1.0, margin=None, width=(0.03, 0.10), positive=False) -> torch.Tensor:
         """
         Random multi-scale source.
         A sum of nblobs terms, each a radial bump in x = log r times a random band-limited angular field.
@@ -302,6 +315,63 @@ class RadialPoissonSolver(nn.Module):
             angular = angular - angular.amin(dim=(-1, -2), keepdim=True)
 
         return torch.einsum("bxy,bk->kxy", angular, radial)
+
+    def _bump_window(self, margin, width) -> torch.Tensor:
+        """Random C-infinity bump in x = log r."""
+
+        device = self.r.device
+        dtype = self.r.dtype
+
+        # range of source support -> leave margin to avoid boundary effects
+        x = self.x
+        span = (x[-1] - x[0]).item()
+        xlo = x[0].item() + margin * span
+        xhi = x[-1].item() - margin * span
+
+        # random half width, clamped so the support always fits, then a random center
+        half = width[0] * span + (width[1] - width[0]) * span * torch.rand((), dtype=dtype, device=device)
+        half = torch.clamp(half, max=0.5 * (xhi - xlo))
+        center = xlo + half + (xhi - xlo - 2 * half) * torch.rand((), dtype=dtype, device=device)
+
+        t = (x - center) / half
+        inside = t.abs() < 1.0
+        window = torch.zeros_like(t)
+        window[inside] = torch.exp(1.0 - 1.0 / (1.0 - t[inside] ** 2))
+
+        return window
+
+    def random_source(self, alpha=2.0, tau=3.0, sigma=None, margin=None, width=(0.03, 0.10), npad=0) -> torch.Tensor:
+        """Random Matern source."""
+
+        # the field hardwires nlon = 2 * nlat, so a mismatch would silently return
+        # a field on a different angular grid than the solver's
+        if self.nlon != 2 * self.nlat:
+            raise ValueError(f"random_source requires nlon == 2 * nlat, got nlat={self.nlat}, nlon={self.nlon}")
+
+        if margin is None:
+            margin = width[1] + 0.02
+
+        key = (alpha, tau, sigma, npad)
+        if getattr(self, "_grf_key", None) != key:
+            self._grf = GaussianRandomFieldRadialS2(
+                nlat=self.nlat,
+                nr=self.nr,
+                r_min=self.rmin,
+                r_max=self.rmax,
+                alpha=alpha,
+                tau=tau,
+                sigma=sigma,
+                grid=self.grid,
+                domain=self.domain,
+                R=self.R,
+                npad=npad,
+                dtype=self.r.dtype,
+            ).to(self.r.device)
+            self._grf_key = key
+
+        window = self._bump_window(margin, width)
+
+        return self._grf(1).squeeze(0) * window.reshape(-1, 1, 1)
 
     def random_boundary_data(self, l_src=8, decay=1.0) -> torch.Tensor:
         """Random band-limited Dirichlet data on the inner sphere."""

@@ -29,9 +29,12 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
+import math
+
 import torch
 
 from .sht import InverseRealSHT
+from .mellin import InverseMellinTransform
 
 
 class GaussianRandomFieldS2(torch.nn.Module):
@@ -131,6 +134,151 @@ class GaussianRandomFieldS2(torch.nn.Module):
 
         # Karhunen-Loeve expansion.
         u = self.isht(xi * self.sqrt_eig)
+
+        return u
+
+    # Override cuda and to methods so sampler gets initialized with mean
+    # and variance on the correct device.
+    def cuda(self, *args, **kwargs):
+        super().cuda(*args, **kwargs)
+        self.gaussian_noise = torch.distributions.normal.Normal(self.mean, self.var)
+
+        return self
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.gaussian_noise = torch.distributions.normal.Normal(self.mean, self.var)
+
+        return self
+
+
+class GaussianRandomFieldRadialS2(torch.nn.Module):
+    r"""
+    Gaussian random field on :math:`(0, \infty) \times S^2` via Karhunen--Loève expansion.
+
+    Samples realisations of a centred Gaussian random field whose covariance
+    operator has the Matérn-like power spectrum
+
+    .. math::
+
+        C_{\omega l} = \sigma^2
+              \left(\omega^2 + \frac{l(l+1)}{R^2} + \tau^2\right)^{-\alpha}
+
+    where :math:`l` is the spherical harmonic degree and :math:`\omega` is the
+    Mellin frequency conjugate to :math:`x = \log r`.
+
+    Parameters
+    ----------
+    nlat : int
+        Number of latitudinal grid points.
+    nr : int
+        Number of radial grid points.
+    r_min, r_max : float
+        Bounds on :math:`r`, or on :math:`\rho / R = (r - R) / R` for the
+        exterior domain.
+    nlon : int, optional
+        Number of longitudinal grid points.  Default ``2 * nlat``.
+    alpha : float, optional
+        Spectral exponent (smoothness).  Must be > 3/2 when ``sigma`` is not
+        given: the field is three-dimensional, so smaller values give samples
+        with infinite variance.  Default ``2.0``.
+    tau : float, optional
+        Inverse correlation length scale.  Default ``3.0``.
+    sigma : float, optional
+        Overall amplitude.  If ``None`` (default), computed from ``alpha``
+        and ``tau`` so that the field variance is :math:`\mathcal{O}(1)`.
+    radius : float, optional
+        Radius of the sphere.  Default ``1.0``.
+    grid : str, optional
+        Grid type for the inverse SHT (``"equiangular"``,
+        ``"legendre-gauss"``, etc.).  Default ``"equiangular"``.
+    domain : str, optional
+        Either ``"half-line"`` or ``"exterior"``, by default ``"half-line"``.
+    R : float, optional
+        Inner radius, required for ``domain="exterior"``, by default None.
+    lmax, mmax, wmax : int, optional
+        Angular and radial truncation, by default inferred from the grids.
+    npad : int, optional
+        Number of zero-padded radial nodes appended in log space, by default 0.
+    dtype : torch.dtype, optional
+        Floating-point dtype.  Default ``torch.float32``.
+    """
+
+    def __init__(
+        self,
+        nlat,
+        nr,
+        r_min,
+        r_max,
+        alpha=2.0,
+        tau=3.0,
+        sigma=None,
+        radius=1.0,
+        grid="equiangular",
+        domain="half-line",
+        R=None,
+        lmax=None,
+        mmax=None,
+        wmax=None,
+        npad=0,
+        dtype=torch.float32,
+    ):
+        super().__init__()
+
+        # Number of latitudinal and longitudinal modes.
+        self.nlat = nlat
+        self.nlon = 2 * nlat
+        self.nr = nr
+
+        # Default value of sigma if None is given
+        if sigma is None:
+            if alpha <= 1.5:
+                raise ValueError(f"Alpha must be greater than 3/2, got {alpha}.")
+            sigma = tau ** (0.5 * (2 * alpha - 3.0))
+
+        # Inverse transforms
+        self.isht = InverseRealSHT(self.nlat, self.nlon, lmax=lmax, mmax=mmax, grid=grid, norm="backward").to(dtype=dtype)
+        self.imellin = InverseMellinTransform(nr, r_min=r_min, r_max=r_max, wmax=wmax, domain=domain, R=R, dim=-3, npad=npad)
+
+        lmax = self.isht.lmax
+        mmax = self.isht.mmax
+
+        # Mellin frequencies 2 * pi * k / L, signed and in torch.fft order.
+        omega = self.imellin.omega.to(torch.float64)
+        ell = torch.arange(lmax, dtype=torch.float64)
+        ell = ell * (ell + 1)
+
+        # Square root of the eigenvalues of C, diagonal in (omega, l) and shared over m.
+        sqrt_eig = omega.view(-1, 1, 1) ** 2 + ell.view(1, -1, 1) / radius**2 + tau**2
+        sqrt_eig = sigma * math.sqrt(self.imellin.length) * sqrt_eig ** (-alpha / 2.0)
+        sqrt_eig = torch.tril(sqrt_eig.expand(-1, -1, mmax))
+        # (omega, l, m) = 0 is the mean of the field
+        sqrt_eig[0, 0, 0] = 0.0
+        sqrt_eig = sqrt_eig.unsqueeze(0).to(dtype=dtype)
+        self.register_buffer("sqrt_eig", sqrt_eig)
+
+        # Save mean and var of the standard Gaussian.
+        # Need these to re-initialize distribution on a new device.
+        mean = torch.as_tensor([0.0]).to(dtype=dtype)
+        var = torch.as_tensor([1.0]).to(dtype=dtype)
+        self.register_buffer("mean", mean)
+        self.register_buffer("var", var)
+
+        # Standard normal noise sampler.
+        self.gaussian_noise = torch.distributions.normal.Normal(self.mean, self.var)
+
+    def forward(self, N, xi=None):
+
+        # Sample Gaussian noise.
+        if xi is None:
+            nw = self.imellin.nw
+            lmax = self.isht.lmax
+            mmax = self.isht.mmax
+            xi = self.gaussian_noise.sample(torch.Size((N, nw, lmax, mmax, 2))).squeeze(-1)
+            xi = torch.view_as_complex(xi)
+
+        # Karhunen-Loeve expansion
+        u = self.isht(self.imellin(xi * self.sqrt_eig))
 
         return u
 
