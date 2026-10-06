@@ -39,7 +39,6 @@ from torch_harmonics.fft import _pad_dim_right, irfft, rfft
 from torch_harmonics.quadrature import precompute_radii
 from torch_harmonics.utils import check
 
-
 # real dtypes with a complex counterpart; bfloat16 deliberately absent
 _COMPLEX_FOR_REAL = {torch.float16: torch.complex32, torch.float32: torch.complex64, torch.float64: torch.complex128}
 

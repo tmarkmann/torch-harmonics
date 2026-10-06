@@ -385,9 +385,7 @@ class SpectralConvRadialS2(nn.Module):
             bias_shape = [1, self.in_channels, self.nw, self.lmax, self.mmax] + ([2] if real_kernel else [])
             self.spectral_bias = nn.Parameter(torch.zeros(*bias_shape, dtype=torch.complex64))
             # volume mean rather than integral, so the bias stays trainable and scale covariant
-            self.quadrature = QuadratureRadialS2(
-                img_shape=in_shape, rmin=rmin, rmax=rmax, grid=grid_in, domain=domain, inner_radius=inner_radius, normalize=True
-            )
+            self.quadrature = QuadratureRadialS2(img_shape=in_shape, rmin=rmin, rmax=rmax, grid=grid_in, domain=domain, inner_radius=inner_radius, normalize=True)
 
     def extra_repr(self):
         return f"in_channels={self.in_channels}, out_channels={self.out_channels},\n lmax={self.lmax}, mmax={self.mmax}, nw={self.nw}, c={self.c},\n real_kernel={self.real_kernel}, num_groups={self.num_groups}"
