@@ -719,3 +719,114 @@ class QuadratureS2(torch.nn.Module):
         quad = torch.sum(x * self.quad_weight, dim=(-2, -1))
 
         return quad
+
+
+class QuadratureRadialS2(torch.nn.Module):
+    r"""
+    Scalar quadrature on :math:`(0, \infty) \times S^2` or :math:`[R, \infty) \times S^2`
+    for integrating fields defined on a radial and latitude/longitude grid.
+
+    Given a signal :math:`f(r, \theta, \lambda)` sampled on a geometric radial grid and a
+    latitude--longitude grid, this module approximates the volume integral
+
+    .. math::
+
+        I[f] = \int_{r_\text{min}}^{r_\text{max}} \int_{S^2}
+            f(r, \theta, \lambda)\, r^2 \; dA \; dr
+        \;\approx\; \sum_{i=0}^{N_r - 1} w_i\, r_i^2\, \sum_{k, j}
+            f(r_i, \theta_k, \lambda_j)\, q_k\, \Delta\lambda
+
+    where :math:`w_i` are the trapezoidal weights of the geometric radial grid (see
+    :func:`precompute_radii`) and the angular part is :class:`QuadratureS2`.
+
+    When ``normalize=True``, the integral is divided by the discrete volume
+    :math:`4\pi \sum_i w_i r_i^2`, so that the output is the mean over the domain.
+
+    Parameters
+    ----------
+    img_shape : Tuple[int]
+        Grid shape ``(nr, nlat, nlon)``.
+    rmin, rmax : float
+        Bounds on r, or on rho = (r - inner_radius) / inner_radius for the exterior domain.
+    grid : str, optional
+        Angular quadrature grid type, see :class:`QuadratureS2`, by default ``"equiangular"``.
+    domain : str, optional
+        Either ``"half-line"`` or ``"exterior"``, by default ``"half-line"``.
+    inner_radius : float, optional
+        Inner radius, required for ``domain="exterior"``, by default None.
+    normalize : bool, optional
+        If ``True``, divides by the volume to return the mean instead of the integral,
+        by default ``False``.
+
+    Examples
+    --------
+    Integrate :math:`e^{-r}` over the whole space (:math:`\int e^{-r}\, dV = 8\pi`):
+
+    >>> import torch
+    >>> import torch_harmonics as th
+    >>> nr, nlat, nlon = 64, 32, 64
+    >>> quad = th.QuadratureRadialS2(img_shape=(nr, nlat, nlon), rmin=1e-6, rmax=60.0, grid="legendre-gauss")
+    >>> f = torch.exp(-quad.r).float().reshape(1, nr, 1, 1).expand(1, nr, nlat, nlon)
+    >>> round(quad(f).item(), 4)  # ≈ 8π; the weights buffers are float32
+    25.1327
+
+    Compute the mean of a field over the domain:
+
+    >>> quad_norm = th.QuadratureRadialS2(img_shape=(nr, nlat, nlon), rmin=1e-6, rmax=60.0, grid="legendre-gauss", normalize=True)
+    >>> round(quad_norm(torch.ones(1, nr, nlat, nlon)).item(), 5)
+    1.0
+    """
+
+    def __init__(
+        self,
+        img_shape: Tuple[int],
+        rmin: float,
+        rmax: float,
+        grid: Optional[str] = "equiangular",
+        domain: Optional[str] = "half-line",
+        inner_radius: Optional[float] = None,
+        normalize: Optional[bool] = False,
+    ):
+        super().__init__()
+
+        self.grid = grid
+        self.domain = domain
+        self.inner_radius = inner_radius
+        self.normalize = normalize
+
+        nr, nlat, nlon = img_shape
+
+        # angular part
+        self.quadrature = QuadratureS2(img_shape=(nlat, nlon), grid=grid, normalize=normalize)
+
+        # radial part of the volume element r^2 dr
+        _, r, w = precompute_radii(nr, rmin, rmax, domain=domain, inner_radius=inner_radius)
+        radial_weight = w * r**2
+
+        # apply normalization, the angular part is already divided by 4 pi
+        if normalize:
+            radial_weight = radial_weight / radial_weight.sum()
+
+        self.register_buffer("r", r, persistent=False)
+        self.register_buffer("radial_weight", radial_weight.to(torch.float32), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Integrate a signal over the volume using the precomputed quadrature.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input signal of shape ``(..., nr, nlat, nlon)``. Integration is over the last
+            three (spatial) dimensions.
+
+        Returns
+        -------
+        torch.Tensor
+            Integral of shape ``(...)`` (the input with its last three dimensions reduced).
+        """
+
+        # integrate over the angular axes, then the radial one
+        quad = torch.sum(self.quadrature(x) * self.radial_weight, dim=-1)
+
+        return quad
