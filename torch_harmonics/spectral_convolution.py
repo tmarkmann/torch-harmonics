@@ -259,16 +259,8 @@ class SpectralConvRadialS2(nn.Module):
     r"""
     Spectral convolution layer on :math:`(0, \infty) \times S^2` or
     :math:`[R, \infty) \times S^2` with :math:`R` the inner radius, combining the spherical harmonic transform on the
-    angular axes with the Mellin transform on the radial axis.
-
-    The weights are diagonal in :math:`(\omega, l)` and shared across the order :math:`m`. By
-    default the radial kernel is real in :math:`x = \log r`, i.e. the weights satisfy
-    :math:`K(-\omega) = \overline{K(\omega)}`. This is implemented by applying the real Mellin
-    transform to the real and imaginary parts of the SHT coefficients, so only the non-negative
-    frequencies carry weights. A real kernel acts identically on all orders :math:`m`, which
-    makes the layer equivariant to rotations and reflections, as for any real-valued isotropic
-    operator. A complex kernel instead acts as :math:`K` on :math:`m > 0` and as
-    :math:`\overline{K}` on :math:`m < 0`, which adds a handedness about the polar axis.
+    angular axes with the Mellin transform on the radial axis. The weights are diagonal in :math:`(\omega, l)` and
+    shared across the order :math:`m`.
 
     Parameters
     ----------
@@ -298,11 +290,13 @@ class SpectralConvRadialS2(nn.Module):
         Zero-padded radial nodes in log space, by default 0.
     c : float, optional
         Real part of the Mellin variable s = c - i omega, by default 0.5.
+    extension : str, optional
+        Continuation of the radial signal, ``"circular"`` or ``"reflect"``
+        (mirrored, i.e. a DCT-I), see :class:`MellinTransform`. By default ``"circular"``.
     real_kernel : bool, optional
         If ``True``, the radial kernel is real in log r and only the non-negative Mellin
         frequencies carry weights. If ``False``, all frequencies carry independent complex
-        weights, which only suits problems with a handedness about the polar axis. By default
-        ``True``.
+        weights. By default ``True``.
     bias : bool, optional
         If ``True``, adds a learnable spectral bias scaled by the volume mean, by
         default ``False``.
@@ -326,6 +320,7 @@ class SpectralConvRadialS2(nn.Module):
         wmax: Optional[int] = None,
         npad: Optional[int] = 0,
         c: Optional[float] = 0.5,
+        extension: Optional[str] = "circular",
         real_kernel: Optional[bool] = True,
         bias: Optional[bool] = False,
     ):
@@ -341,6 +336,7 @@ class SpectralConvRadialS2(nn.Module):
         self.out_channels = out_channels
         self.num_groups = num_groups
         self.c = c
+        self.extension = extension
         self.real_kernel = real_kernel
 
         nr_in, nlat_in, nlon_in = in_shape
@@ -356,9 +352,10 @@ class SpectralConvRadialS2(nn.Module):
         self.sht = RealSHT(nlat_in, nlon_in, lmax=self.lmax, mmax=self.mmax, grid=grid_in)
         self.isht = InverseRealSHT(nlat_out, nlon_out, lmax=self.lmax, mmax=self.mmax, grid=grid_out)
 
-        # compute the radial truncation
+        # compute the radial truncation from the length of the extended log box
         if wmax is None:
-            wmax = (nr_in + npad) // 2 + 1 if nr_in == nr_out else min(nr_in + npad, nr_out + npad) // 2
+            ntot_in, ntot_out = [2 * (nr - 1) if extension == "reflect" else nr + npad for nr in (nr_in, nr_out)]
+            wmax = ntot_in // 2 + 1 if nr_in == nr_out else min(ntot_in, ntot_out) // 2
 
         # radial transforms. A real kernel transforms the real and imaginary parts of the SHT
         # coefficients separately, which are stacked on a trailing axis behind the radial one
@@ -366,8 +363,8 @@ class SpectralConvRadialS2(nn.Module):
             mellin, imellin, rdim = RealMellinTransform, InverseRealMellinTransform, -4
         else:
             mellin, imellin, rdim = MellinTransform, InverseMellinTransform, -3
-        self.mellin = mellin(nr_in, rmin, rmax, wmax=wmax, domain=domain, inner_radius=inner_radius, dim=rdim, npad=npad, c=c)
-        self.imellin = imellin(nr_out, rmin, rmax, wmax=wmax, domain=domain, inner_radius=inner_radius, dim=rdim, npad=npad, c=c)
+        self.mellin = mellin(nr_in, rmin, rmax, wmax=wmax, domain=domain, inner_radius=inner_radius, dim=rdim, npad=npad, c=c, extension=extension)
+        self.imellin = imellin(nr_out, rmin, rmax, wmax=wmax, domain=domain, inner_radius=inner_radius, dim=rdim, npad=npad, c=c, extension=extension)
         self.wmax = wmax
         self.nw = self.mellin.nw
 
@@ -388,7 +385,7 @@ class SpectralConvRadialS2(nn.Module):
             self.quadrature = QuadratureRadialS2(img_shape=in_shape, rmin=rmin, rmax=rmax, grid=grid_in, domain=domain, inner_radius=inner_radius, normalize=True)
 
     def extra_repr(self):
-        return f"in_channels={self.in_channels}, out_channels={self.out_channels},\n lmax={self.lmax}, mmax={self.mmax}, nw={self.nw}, c={self.c},\n real_kernel={self.real_kernel}, num_groups={self.num_groups}"
+        return f"in_channels={self.in_channels}, out_channels={self.out_channels},\n lmax={self.lmax}, mmax={self.mmax}, nw={self.nw}, c={self.c}, extension={self.extension},\n real_kernel={self.real_kernel}, num_groups={self.num_groups}"
 
     def _apply(self, fn, *args, **kwargs):
         return super()._apply(_keep_complex(fn), *args, **kwargs)

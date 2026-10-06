@@ -95,11 +95,20 @@ class _MellinBase(nn.Module):
         Number of zero-padded nodes appended in log space, by default 0
     c : float, optional
         Real part of the Mellin variable s = c - i omega. By default 0
+    extension : str, optional
+        How the signal is continued beyond the log box, by default ``"circular"``.
+        ``"circular"`` wraps around after the ``npad`` zero-padded nodes. ``"reflect"``
+        mirrors the signal at both ends without repeating the edge nodes (i.e. a DCT-I).
     """
 
-    def __init__(self, nr, rmin, rmax, wmax=None, domain="half-line", inner_radius=None, dim=-1, npad=0, c=0.0):
+    def __init__(self, nr, rmin, rmax, wmax=None, domain="half-line", inner_radius=None, dim=-1, npad=0, c=0.0, extension="circular"):
 
         super().__init__()
+
+        if extension not in ("circular", "reflect"):
+            raise ValueError(f"Unknown extension: {extension}")
+        if extension == "reflect" and npad > 0:
+            raise ValueError("npad must be 0 for the reflect extension")
 
         self.nr = nr
         self.domain = domain
@@ -107,13 +116,14 @@ class _MellinBase(nn.Module):
         self.dim = dim
         self.npad = npad
         self.c = c
+        self.extension = extension
 
         # geometric radial grid
         x, r, w = precompute_radii(nr, rmin, rmax, domain=domain, inner_radius=inner_radius)
 
         # log-grid spacing dx = dr/r
         self.dx = (x[-1] - x[0]).item() / (nr - 1)
-        self.ntot = nr + npad
+        self.ntot = 2 * (nr - 1) if extension == "reflect" else nr + npad
         self.length = self.ntot * self.dx
         self.wmax = self.ntot // 2 + 1 if wmax is None else wmax
 
@@ -147,8 +157,19 @@ class _MellinBase(nn.Module):
         angle = sign * self.origin_angle
         return torch.complex(dx * torch.cos(angle), dx * torch.sin(angle)).to(dtype)
 
+    def _extend(self, x: torch.Tensor) -> torch.Tensor:
+        """Continue the last axis to ``ntot`` nodes, by zero-padding or by mirroring at both ends."""
+
+        if self.extension == "reflect":
+            # mirroring for the DCT-I
+            return torch.cat([x, x.flip(-1)[..., 1:-1]], dim=-1)
+
+        return _pad_dim_right(x, -1, self.ntot)
+
     def extra_repr(self):
-        return f"nr={self.nr}, wmax={self.wmax}, c={self.c},\n domain={self.domain}, inner_radius={self.inner_radius},\n dim={self.dim}, npad={self.npad}"
+        return (
+            f"nr={self.nr}, wmax={self.wmax}, c={self.c}, extension={self.extension},\n domain={self.domain}, inner_radius={self.inner_radius},\n dim={self.dim}, npad={self.npad}"
+        )
 
     def _check_dim(self, x: torch.Tensor, size: int, what: str):
         check(-x.dim() <= self.dim < x.dim(), lambda: f"Expected tensor with a dim={self.dim} axis but got {x.dim()} dimensions instead")
@@ -191,8 +212,8 @@ class RealMellinTransform(_MellinBase):
         # Mellin weight r^c
         x = x * self.rc.to(x.real.dtype)
 
-        # zero-pad the log box so that the wrap-around of the periodic FFT does not couple both ends
-        x = _pad_dim_right(x, -1, self.ntot)
+        # extend the log box, so that the wrap-around of the periodic FFT does not couple both ends
+        x = self._extend(x)
 
         x = rfft(x, nmodes=self.wmax, dim=-1, norm="backward")
 
@@ -235,7 +256,7 @@ class InverseRealMellinTransform(_MellinBase):
         # apply inverse FFT
         x = irfft(x * self._origin_phase(1.0, 1.0 / self.length, x.dtype), n=self.ntot, dim=-1, norm="forward")
 
-        # drop the padded tail and undo the Mellin weight
+        # drop the padded or mirrored tail and undo the Mellin weight
         x = x.narrow(-1, 0, self.nr) / self.rc.to(x.real.dtype)
 
         return x.movedim(-1, self.dim)
@@ -277,8 +298,8 @@ class MellinTransform(_MellinBase):
         # Mellin weight r^c
         x = x * self.rc.to(x.real.dtype)
 
-        # zero-pad the log box so that the wrap-around of the periodic FFT does not couple both ends
-        x = _pad_dim_right(x, -1, self.ntot)
+        # extend the log box, so that the wrap-around of the periodic FFT does not couple both ends
+        x = self._extend(x)
 
         # apply complex fft
         x = torch.fft.fft(x, dim=-1, norm="backward")
@@ -333,7 +354,7 @@ class InverseMellinTransform(_MellinBase):
         # apply the inverse FFT
         x = torch.fft.ifft(x, n=self.ntot, dim=-1, norm="forward")
 
-        # drop the padded tail and undo the Mellin weight
+        # drop the padded or mirrored tail and undo the Mellin weight
         x = x.narrow(-1, 0, self.nr) / self.rc.to(x.real.dtype)
 
         return x.movedim(-1, self.dim)
