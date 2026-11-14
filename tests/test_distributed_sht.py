@@ -35,7 +35,6 @@ import torch
 from parameterized import parameterized
 from testutils import (
     compare_tensors,
-    disable_tf32,
     gather_tensor_hw,
     reduce_success,
     set_seed,
@@ -60,41 +59,12 @@ def tearDownModule():
     teardown_module(_DIST_CTX)
 
 
-def _report_margin(name, ref, got, atol, rtol):
-    """
-    Print how far the distributed result is from the serial one, in the units that matter.
-
-    The tolerance discussion below is about the reassociation error of a distributed sum,
-    which scales with the tensor's largest entries, not with the entry it lands on. Printed
-    unconditionally (on rank 0) rather than only on failure, so the margin is visible on
-    every backend and device, and the tolerance can be calibrated against it.
-    """
-    diff = (got - ref).abs().max().item()
-    scale = ref.abs().max().item()
-    eps = torch.finfo(ref.real.dtype if ref.is_complex() else ref.dtype).eps
-    print(f"{name}: max|diff| = {diff:.3e}, max|ref| = {scale:.3e}, " f"= {diff / max(eps * scale, 1e-30):.1f} eps*max|ref| (atol {atol:.0e}, rtol {rtol:.0e})")
-
-
-def _range_atol(ref, atol, ulps=8):
-    """
-    ``atol``, raised to ``ulps`` float ULPs of the tensor's largest entry.
-
-    The criterion the tolerance discussion below arrives at: the reassociation error of the
-    distributed sum scales with ``eps * max|ref|``, so a fixed atol calibrated on an O(1)
-    output is far too tight for a tensor of scale ~1e3 (the ISHT input gradients are), where
-    plain float32 rounding alone is ~2e-4. The worst measured case is ~1.6 eps*max|ref|.
-    """
-    eps = torch.finfo(ref.real.dtype if ref.is_complex() else ref.dtype).eps
-    return max(atol, ulps * eps * ref.abs().max().item())
-
-
 class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
     """Test the distributed spherical harmonic transform module (CPU/CUDA if available)."""
 
     @classmethod
     def setUpClass(cls):
         setup_class_from_context(cls, _DIST_CTX)
-        disable_tf32()
 
     def _split_helper(self, tensor):
         return split_tensor_hw(tensor, hdim=-2, wdim=-1, hsize=self.grid_size_h, wsize=self.grid_size_w, hrank=self.hrank, wrank=self.wrank)
@@ -117,6 +87,21 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
         return tensor_gather
 
     def _gather_helper_bwd(self, tensor, transform_dist):
+        """Gather a spatial field: ``(nlat, nlon)`` blocks on a regular grid, bands of the pixel axis on HEALPix."""
+        if isinstance(transform_dist.grid, th.HealpixGrid):
+            return gather_tensor_hw(
+                tensor,
+                hdim=-1,
+                wdim=-1,
+                hshapes=transform_dist.pixel_shapes,
+                wshapes=[],
+                hsize=self.grid_size_h,
+                wsize=1,
+                hrank=self.hrank,
+                wrank=self.wrank,
+                hgroup=self.h_group,
+                wgroup=self.w_group,
+            )
 
         tensor_gather = gather_tensor_hw(
             tensor,
@@ -134,6 +119,114 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
 
         return tensor_gather
 
+    def _split_spatial(self, tensor, transform_dist):
+        """This rank's piece of a spatial field: its ``(nlat, nlon)`` block, or on HEALPix its band of rings, a slice of the pixel axis."""
+        if isinstance(transform_dist.grid, th.HealpixGrid):
+            return torch.split(tensor, transform_dist.pixel_shapes, dim=-1)[self.hrank].contiguous()
+        return self._split_helper(tensor)
+
+    @parameterized.expand(
+        [
+            (geometry, vector, dtype, lmax, mmax, lmmax)
+            for geometry, cases in [
+                ("equiangular", [(16, 16, None), (15, 7, None), (15, 9, None), (15, 7, 8), (15, 15, 5), (16, 1, None), (16, 0, None)]),
+                ("fejer1", [(17, 17, None), (17, 17, 5), (16, 9, None)]),
+            ]
+            for vector in (False, True)
+            for dtype in (torch.float32, torch.float64)
+            for lmax, mmax, lmmax in cases
+        ],
+        skip_on_empty=True,
+    )
+    def test_extended_folded(self, geometry, vector, dtype, lmax, mmax, lmmax):
+        """Uneven shards, padded channels and masked high-bandlimit analysis."""
+        grid = th.as_grid(geometry, nlat=17, nlon=33)
+        serial = (th.RealVectorSHT if vector else th.RealSHT)(grid, lmax=lmax, mmax=mmax, lmmax=lmmax).to(self.device, dtype)
+        if mmax < self.grid_size_w:
+            # Existing distributed partitions require a nonempty order shard.
+            with self.assertRaises(RuntimeError):
+                (thd.DistributedRealVectorSHT if vector else thd.DistributedRealSHT)(grid, lmax=lmax, mmax=mmax, lmmax=lmmax)
+            return
+        distributed = (thd.DistributedRealVectorSHT if vector else thd.DistributedRealSHT)(grid, lmax=lmax, mmax=mmax, lmmax=lmmax).to(self.device, dtype)
+        self.assertTrue(distributed._extended_folded)
+        block = serial.weights[
+            ..., distributed.mmax_offset : distributed.mmax_offset + distributed.mmax_local, :, distributed.lat_offset : distributed.lat_offset + distributed.nlat_local
+        ]
+        # a rank's blocks cover fewer orders than the serial ones, which changes the roundoff of
+        # the folded projection at the level of float64; in float32 that can flip the rounding of
+        # an entry, by one ulp, or by about 1e-17 at entries that are themselves roundoff
+        torch.testing.assert_close(distributed.weights, block, atol=1e-13, rtol=1e-13 if dtype == torch.float64 else 1.2e-7)
+        # Independent analytic top-degree zonal scalar harmonic and its vector derivative.
+        # SciPy's recurrence supplies the spatial field; no shared synthesis is used.
+        import numpy as np
+        from scipy.special import eval_legendre, lpmv
+
+        l = lmax - 1
+        theta = grid.colats.numpy()
+        normalization = np.sqrt((2 * l + 1) / (4 * np.pi))
+        if vector:
+            field = normalization * lpmv(1, l, np.cos(theta))
+            spatial = torch.zeros(1, 1, 2, *grid.shape, device=self.device, dtype=dtype)
+            spatial[..., 0, :, :] = torch.tensor(field, device=self.device, dtype=dtype)[:, None]
+        else:
+            field = normalization * eval_legendre(l, np.cos(theta))
+            spatial = torch.tensor(field, device=self.device, dtype=dtype)[None, None, :, None].expand(1, 1, *grid.shape).contiguous()
+        from unittest.mock import patch
+
+        import torch_harmonics.distributed.distributed_sht as implementation
+
+        # Instrument the complete forward: exactly the existing two azimuth
+        # redistributions and one polar reduction, with no latitude gather.
+        with (
+            patch.object(implementation, "distributed_transpose_azimuth", wraps=implementation.distributed_transpose_azimuth) as transpose,
+            patch.object(implementation, "reduce_from_scatter_to_polar_region", wraps=implementation.reduce_from_scatter_to_polar_region) as reduction,
+        ):
+            local = distributed(self._split_helper(spatial))
+            self.assertEqual(transpose.call_count, 2 if self.grid_size_w > 1 else 0)
+            self.assertEqual(reduction.call_count, 1 if self.grid_size_h > 1 else 0)
+        actual = self._gather_helper_fwd(local, distributed)
+        expected = torch.zeros_like(actual)
+        if mmax and (lmmax is None or l < lmmax):
+            if vector:
+                expected[..., 0, l, 0] = 1
+            else:
+                expected[..., l, 0] = 1
+        ok = compare_tensors("analytic CC", actual, expected, atol=2e-6 if dtype == torch.float32 else 2e-13, rtol=0)
+        self.assertTrue(reduce_success(ok, self.device))
+        # A high global order exercises ranks whose interval starts away from zero,
+        # both continuation parities, and both spheroidal/toroidal conventions.
+        if mmax > 2:
+            from scipy.special import gammaln
+
+            m = mmax - 1
+            theta = theta[:, None]
+            phi = grid.lons().numpy()[None, :]
+            normalization *= np.exp(0.5 * (gammaln(l - m + 1) - gammaln(l + m + 1)))
+            p = normalization * lpmv(m, l, np.cos(theta))
+            harmonic = p * np.exp(1j * m * phi)
+            derivative = np.zeros_like(harmonic)
+            ring_slice = slice(None) if geometry == "fejer1" else slice(1, -1)
+            derivative[ring_slice] = (
+                (l * np.cos(theta[ring_slice]) * p[ring_slice] - (l + m) * normalization * lpmv(m, l - 1, np.cos(theta[ring_slice])))
+                / np.sin(theta[ring_slice])
+                * np.exp(1j * m * phi)
+            )
+            longitude = np.zeros_like(harmonic)
+            longitude[ring_slice] = 1j * m * harmonic[ring_slice] / np.sin(theta[ring_slice])
+            coefficient = 0.7 + 0.3j
+            for component in range(2) if vector else range(1):
+                basis = np.stack((derivative, longitude) if component == 0 else (longitude, -derivative)) if vector else harmonic
+                spatial = torch.tensor(2 * (coefficient * basis).real, device=self.device, dtype=dtype)[None, None]
+                actual = self._gather_helper_fwd(distributed(self._split_helper(spatial)), distributed)
+                expected = torch.zeros_like(actual)
+                if lmmax is None or l - m < lmmax:
+                    if vector:
+                        expected[..., component, l, m] = coefficient
+                    else:
+                        expected[..., l, m] = coefficient
+                ok = compare_tensors("high-order analytic CC", actual, expected, atol=2e-6 if dtype == torch.float32 else 2e-13, rtol=0)
+                self.assertTrue(reduce_success(ok, self.device))
+
     # Tolerances are atol=1e-5, rtol=1e-6, loosened from the near-exact agreement these rows
     # used to demand. The Legendre contraction is a distributed matmul: each polar rank
     # contracts the latitudes (forward) or degrees (inverse) it owns, and the partial sums are
@@ -147,7 +240,7 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
     # can cover that without also asserting something false about small outputs. The criterion
     # that does match the numerics is absolute and scaled to the tensor's dynamic range,
     # eps_fp32 * max|x|, which is ~1e-6 for the O(1) outputs; atol=1e-5 is the floor, raised to
-    # 8 eps*max|x| by _range_atol for tensors of larger scale, like the ISHT input gradients.
+    # 8 eps*max|x| by compare_tensors(ulps=8) for tensors of larger scale, like the ISHT input gradients.
     #
     # This is a ULP-level allowance, not a general loosening: a genuine defect in the splitting
     # or the collective shows up as O(1e-3) or worse, far outside this band. Worth re-measuring
@@ -156,10 +249,6 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
         [
             # lmax automatically determined
             # Scalar SHT
-            [32, 64, None, 32, 8, "equiangular", False, 1e-5, 1e-6],
-            [32, 64, None, 32, 8, "legendre-gauss", False, 1e-5, 1e-6],
-            [32, 64, None, 32, 8, "equiangular", False, 1e-5, 1e-6],
-            [32, 64, None, 32, 8, "legendre-gauss", False, 1e-5, 1e-6],
             [32, 64, None, 32, 8, "equiangular", False, 1e-5, 1e-6],
             [32, 64, None, 32, 8, "legendre-gauss", False, 1e-5, 1e-6],
             [33, 64, None, 1, 10, "equiangular", False, 1e-5, 1e-6],
@@ -195,39 +284,79 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
             [32, 64, 8, 32, 8, "legendre-gauss", True, 1e-5, 1e-6],
             [33, 64, 9, 1, 10, "equiangular", True, 1e-5, 1e-6],
             [33, 64, 8, 1, 10, "legendre-gauss", True, 1e-5, 1e-6],
-            # upsampling
-            # Scalar SHT
+            # Equiangular analysis permits these high degrees and warns; the Gauss
+            # counterparts are now rejected and remain covered by inverse tests below.
             [32, 64, 64, 32, 8, "equiangular", False, 1e-5, 1e-6],
-            [32, 64, 64, 32, 8, "legendre-gauss", False, 1e-5, 1e-6],
             [33, 64, 65, 1, 10, "equiangular", False, 1e-5, 1e-6],
-            [33, 64, 64, 1, 10, "legendre-gauss", False, 1e-5, 1e-6],
-            # Vector SHT
             [32, 64, 64, 32, 8, "equiangular", True, 1e-5, 1e-6],
-            [32, 64, 64, 32, 8, "legendre-gauss", True, 1e-5, 1e-6],
             [33, 64, 65, 1, 10, "equiangular", True, 1e-5, 1e-6],
-            [33, 64, 64, 1, 10, "legendre-gauss", True, 1e-5, 1e-6],
+            # Asymmetric truncation, including uneven order partitions.
+            [32, 64, 24, 1, 10, "legendre-gauss", False, 1e-5, 1e-6, 9, None],
+            [32, 64, 24, 1, 10, "legendre-gauss", False, 1e-5, 1e-6, 9, 6],
+            [32, 64, 24, 1, 10, "legendre-gauss", True, 1e-5, 1e-6, 9, 6],
+            [96, 192, 85, 1, 2, "legendre-gauss", False, 1e-5, 1e-6, 43, 43],
+            [96, 192, 85, 1, 2, "legendre-gauss", True, 1e-5, 1e-6, 43, 43],
+            [96, 192, 64, 1, 2, "legendre-gauss", False, 1e-5, 1e-6, 43, 43],
+            [96, 192, 64, 1, 2, "legendre-gauss", True, 1e-5, 1e-6, 43, 43],
+            [96, 192, 85, 1, 2, "legendre-gauss", False, 1e-10, 1e-10, 43, 43, torch.float64],
+            [96, 192, 64, 1, 2, "legendre-gauss", True, 1e-10, 1e-10, 43, 43, torch.float64],
+            # Fejer-1 at its default truncation
+            [32, 64, None, 32, 8, "fejer1", False, 1e-5, 1e-6],
+            [33, 64, None, 1, 10, "fejer1", True, 1e-5, 1e-6],
+            # extended (folded) analysis beyond the native band, 17x33 for uneven shards
+            [17, 33, 16, 1, 1, "equiangular", False, 1e-5, 1e-6, 16, None, torch.float32],
+            [17, 33, 15, 1, 1, "equiangular", False, 1e-5, 1e-6, 7, None, torch.float32],
+            [17, 33, 15, 1, 1, "equiangular", False, 1e-5, 1e-6, 9, None, torch.float32],
+            [17, 33, 15, 1, 1, "equiangular", False, 1e-5, 1e-6, 7, 8, torch.float32],
+            [17, 33, 15, 1, 1, "equiangular", False, 1e-5, 1e-6, 15, 5, torch.float32],
+            [17, 33, 17, 1, 1, "fejer1", False, 1e-5, 1e-6, 17, None, torch.float32],
+            [17, 33, 17, 1, 1, "fejer1", False, 1e-5, 1e-6, 17, 5, torch.float32],
+            [17, 33, 16, 1, 1, "fejer1", False, 1e-5, 1e-6, 9, None, torch.float32],
+            [17, 33, 16, 1, 1, "equiangular", True, 1e-5, 1e-6, 16, None, torch.float32],
+            [17, 33, 15, 1, 1, "equiangular", True, 1e-5, 1e-6, 7, None, torch.float32],
+            [17, 33, 15, 1, 1, "equiangular", True, 1e-5, 1e-6, 9, None, torch.float32],
+            [17, 33, 15, 1, 1, "equiangular", True, 1e-5, 1e-6, 7, 8, torch.float32],
+            [17, 33, 15, 1, 1, "equiangular", True, 1e-5, 1e-6, 15, 5, torch.float32],
+            [17, 33, 17, 1, 1, "fejer1", True, 1e-5, 1e-6, 17, None, torch.float32],
+            [17, 33, 17, 1, 1, "fejer1", True, 1e-5, 1e-6, 17, 5, torch.float32],
+            [17, 33, 16, 1, 1, "fejer1", True, 1e-5, 1e-6, 9, None, torch.float32],
+            [17, 33, 16, 1, 1, "equiangular", False, 1e-12, 1e-12, 16, None, torch.float64],
+            [17, 33, 15, 1, 1, "equiangular", False, 1e-12, 1e-12, 7, None, torch.float64],
+            [17, 33, 15, 1, 1, "equiangular", False, 1e-12, 1e-12, 9, None, torch.float64],
+            [17, 33, 15, 1, 1, "equiangular", False, 1e-12, 1e-12, 7, 8, torch.float64],
+            [17, 33, 15, 1, 1, "equiangular", False, 1e-12, 1e-12, 15, 5, torch.float64],
+            [17, 33, 17, 1, 1, "fejer1", False, 1e-12, 1e-12, 17, None, torch.float64],
+            [17, 33, 17, 1, 1, "fejer1", False, 1e-12, 1e-12, 17, 5, torch.float64],
+            [17, 33, 16, 1, 1, "fejer1", False, 1e-12, 1e-12, 9, None, torch.float64],
+            [17, 33, 16, 1, 1, "equiangular", True, 1e-12, 1e-12, 16, None, torch.float64],
+            [17, 33, 15, 1, 1, "equiangular", True, 1e-12, 1e-12, 7, None, torch.float64],
+            [17, 33, 15, 1, 1, "equiangular", True, 1e-12, 1e-12, 9, None, torch.float64],
+            [17, 33, 15, 1, 1, "equiangular", True, 1e-12, 1e-12, 7, 8, torch.float64],
+            [17, 33, 15, 1, 1, "equiangular", True, 1e-12, 1e-12, 15, 5, torch.float64],
+            [17, 33, 17, 1, 1, "fejer1", True, 1e-12, 1e-12, 17, None, torch.float64],
+            [17, 33, 17, 1, 1, "fejer1", True, 1e-12, 1e-12, 17, 5, torch.float64],
+            [17, 33, 16, 1, 1, "fejer1", True, 1e-12, 1e-12, 9, None, torch.float64],
         ],
         skip_on_empty=True,
     )
-    def test_distributed_sht(self, nlat, nlon, lmax, batch_size, num_chan, grid, vector, atol, rtol, verbose=True):
+    def test_distributed_sht(self, nlat, nlon, lmax, batch_size, num_chan, grid, vector, atol, rtol, mmax=None, lmmax=None, dtype=torch.float32, verbose=True):
+        self._check_distributed_sht(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax, batch_size, num_chan, vector, atol, rtol, mmax, lmmax, dtype, verbose)
+
+    def _check_distributed_sht(self, grid, lmax, batch_size, num_chan, vector, atol, rtol, mmax=None, lmmax=None, dtype=torch.float32, verbose=True, iter=0):
+        """The distributed forward SHT on ``grid``, a grid descriptor, against the serial one: output and input gradient."""
 
         set_seed(333)
+        mmax = lmax if mmax is None else mmax
 
-        B, C, H, W = batch_size, num_chan, nlat, nlon
+        B, C = batch_size, num_chan
 
         # set up handles
-        if vector:
-            forward_transform_local = th.RealVectorSHT(th.as_grid(grid, nlat=H, nlon=W), lmax=lmax, mmax=lmax).to(self.device)
-            forward_transform_dist = thd.DistributedRealVectorSHT(th.as_grid(grid, nlat=H, nlon=W), lmax=lmax, mmax=lmax).to(self.device)
-        else:
-            forward_transform_local = th.RealSHT(th.as_grid(grid, nlat=H, nlon=W), lmax=lmax, mmax=lmax).to(self.device)
-            forward_transform_dist = thd.DistributedRealSHT(th.as_grid(grid, nlat=H, nlon=W), lmax=lmax, mmax=lmax).to(self.device)
+        local_cls, dist_cls = (th.RealVectorSHT, thd.DistributedRealVectorSHT) if vector else (th.RealSHT, thd.DistributedRealSHT)
+        forward_transform_local = local_cls(grid, lmax=lmax, mmax=mmax, lmmax=lmmax, iter=iter).to(device=self.device, dtype=dtype)
+        forward_transform_dist = dist_cls(grid, lmax=lmax, mmax=mmax, lmmax=lmmax, iter=iter).to(device=self.device, dtype=dtype)
 
-        # create tensors
-        if vector:
-            inp_full = torch.randn((B, C, 2, H, W), dtype=torch.float32, device=self.device)
-        else:
-            inp_full = torch.randn((B, C, H, W), dtype=torch.float32, device=self.device)
+        # create tensors: (B, C, *grid.shape), (B, C, 2, *grid.shape) for a vector field
+        inp_full = torch.randn((B, C, *((2,) if vector else ()), *grid.shape), dtype=dtype, device=self.device)
 
         # local transform
         # FWD pass
@@ -245,7 +374,7 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
 
         # distributed transform
         # FWD pass
-        inp_local = self._split_helper(inp_full.detach().clone())
+        inp_local = self._split_spatial(inp_full.detach().clone(), forward_transform_dist)
         inp_local.requires_grad = True
         out_local = forward_transform_dist(inp_local)
 
@@ -254,6 +383,14 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
         out_local = forward_transform_dist(inp_local)
         out_local.backward(ograd_local)
         igrad_local = inp_local.grad.clone()
+        if getattr(forward_transform_dist, "_extended_folded", False):
+            inp_local.grad = None
+            repeated = forward_transform_dist(inp_local)
+            repeated.backward(ograd_local, retain_graph=True)
+            torch.testing.assert_close(inp_local.grad, igrad_local, atol=0, rtol=0)
+            inp_local.grad = None
+            repeated.backward(ograd_local)
+            torch.testing.assert_close(inp_local.grad, igrad_local, atol=0, rtol=0)
 
         # Print diagnostics from rank 0 only; assert the all-reduced verdict on every
         # rank so a failure on any rank fails the test consistently (see reduce_success).
@@ -261,44 +398,19 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
 
         # evaluate FWD pass
         out_gather_full = self._gather_helper_fwd(out_local, forward_transform_dist)
-        if verbose:
-            _report_margin("output", out_full, out_gather_full, atol, rtol)
-        ok = compare_tensors("output", out_full, out_gather_full, atol=_range_atol(out_full, atol), rtol=rtol, verbose=verbose)
+        ok = compare_tensors("output", out_gather_full, out_full, atol=atol, rtol=rtol, verbose=verbose, ulps=8, report=verbose)
         self.assertTrue(reduce_success(ok, self.device), "output")
 
         # evaluate BWD pass
         igrad_gather_full = self._gather_helper_bwd(igrad_local, forward_transform_dist)
-        if verbose:
-            _report_margin("gradients", igrad_full, igrad_gather_full, atol, rtol)
-        ok = compare_tensors("gradients", igrad_full, igrad_gather_full, atol=_range_atol(igrad_full, atol), rtol=rtol, verbose=verbose)
+        ok = compare_tensors("gradients", igrad_gather_full, igrad_full, atol=atol, rtol=rtol, verbose=verbose, ulps=8, report=verbose)
         self.assertTrue(reduce_success(ok, self.device), "gradients")
 
-    # Tolerances are atol=1e-5, rtol=1e-6, loosened from the near-exact agreement these rows
-    # used to demand. The Legendre contraction is a distributed matmul: each polar rank
-    # contracts the latitudes (forward) or degrees (inverse) it owns, and the partial sums are
-    # combined by a reduce-scatter. Reassociating a float32 sum across ranks perturbs the result
-    # by a couple of ULP of the *summands*.
-    #
-    # atol is what carries this, not rtol, and the reason matters: the worst offenders are
-    # near-cancellation outputs -- elements of magnitude ~0.015 in a tensor whose scale is ~2,
-    # produced by summing terms two orders larger. Their error is inherited from those terms,
-    # so relative to the element itself it is ~1e-4 no matter how the sum is arranged. No rtol
-    # can cover that without also asserting something false about small outputs. The criterion
-    # that does match the numerics is absolute and scaled to the tensor's dynamic range,
-    # eps_fp32 * max|x|, which is ~1e-6 for the O(1) outputs; atol=1e-5 is the floor, raised to
-    # 8 eps*max|x| by _range_atol for tensors of larger scale, like the ISHT input gradients.
-    #
-    # This is a ULP-level allowance, not a general loosening: a genuine defect in the splitting
-    # or the collective shows up as O(1e-3) or worse, far outside this band. Worth re-measuring
-    # at large polar counts, since the spread grows slowly with the number of partial sums.
+    # Tolerances: see the note on test_distributed_sht, the same reasoning applies to the inverse.
     @parameterized.expand(
         [
             # lmax automatically determined
             # Scalar SHT
-            [32, 64, None, 32, 8, "equiangular", False, 1e-5, 1e-6],
-            [32, 64, None, 32, 8, "legendre-gauss", False, 1e-5, 1e-6],
-            [32, 64, None, 32, 8, "equiangular", False, 1e-5, 1e-6],
-            [32, 64, None, 32, 8, "legendre-gauss", False, 1e-5, 1e-6],
             [32, 64, None, 32, 8, "equiangular", False, 1e-5, 1e-6],
             [32, 64, None, 32, 8, "legendre-gauss", False, 1e-5, 1e-6],
             [33, 64, None, 1, 10, "equiangular", False, 1e-5, 1e-6],
@@ -344,30 +456,56 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
             [32, 64, 8, 32, 8, "legendre-gauss", True, 1e-5, 1e-6],
             [33, 64, 9, 1, 10, "equiangular", True, 1e-5, 1e-6],
             [33, 64, 8, 1, 10, "legendre-gauss", True, 1e-5, 1e-6],
+            [32, 64, 24, 1, 10, "legendre-gauss", False, 1e-5, 1e-6, 9, None],
+            [32, 64, 24, 1, 10, "legendre-gauss", False, 1e-5, 1e-6, 9, 6],
+            [32, 64, 24, 1, 10, "legendre-gauss", True, 1e-5, 1e-6, 9, 6],
+            [96, 192, 85, 1, 2, "legendre-gauss", False, 1e-5, 1e-6, 43, 43],
+            [96, 192, 85, 1, 2, "legendre-gauss", True, 1e-5, 1e-6, 43, 43],
+            [96, 192, 64, 1, 2, "legendre-gauss", False, 1e-5, 1e-6, 43, 43],
+            [96, 192, 64, 1, 2, "legendre-gauss", True, 1e-5, 1e-6, 43, 43],
+            [96, 192, 85, 1, 2, "legendre-gauss", False, 1e-10, 1e-10, 43, 43, torch.float64],
+            [96, 192, 64, 1, 2, "legendre-gauss", True, 1e-10, 1e-10, 43, 43, torch.float64],
+            [32, 64, None, 32, 8, "fejer1", False, 1e-5, 1e-6],
+            [33, 64, None, 1, 10, "fejer1", True, 1e-5, 1e-6],
         ],
         skip_on_empty=True,
     )
-    def test_distributed_isht(self, nlat, nlon, lmax, batch_size, num_chan, grid, vector, atol, rtol, verbose=True):
+    def test_distributed_isht(self, nlat, nlon, lmax, batch_size, num_chan, grid, vector, atol, rtol, mmax=None, lmmax=None, dtype=torch.float32, verbose=True):
+        self._check_distributed_isht(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax, batch_size, num_chan, vector, atol, rtol, mmax, lmmax, dtype, verbose)
+
+    def _check_distributed_isht(self, grid, lmax, batch_size, num_chan, vector, atol, rtol, mmax=None, lmmax=None, dtype=torch.float32, verbose=True):
+        """The distributed inverse SHT on ``grid``, a grid descriptor, against the serial one: output and input gradient."""
 
         set_seed(333)
+        mmax = lmax if mmax is None else mmax
 
-        B, C, H, W = batch_size, num_chan, nlat, nlon
+        B, C = batch_size, num_chan
+
+        grid_desc = grid
+        oversized = lmax is not None and lmax > grid_desc.max_recoverable_degree
 
         if vector:
-            forward_transform_local = th.RealVectorSHT(th.as_grid(grid, nlat=H, nlon=W), lmax=lmax, mmax=lmax).to(self.device)
-            backward_transform_local = th.InverseRealVectorSHT(th.as_grid(grid, nlat=H, nlon=W), lmax=lmax, mmax=lmax).to(self.device)
-            backward_transform_dist = thd.DistributedInverseRealVectorSHT(th.as_grid(grid, nlat=H, nlon=W), lmax=lmax, mmax=lmax).to(self.device)
+            forward_transform_local = None if oversized else th.RealVectorSHT(grid_desc, lmax=lmax, mmax=mmax, lmmax=lmmax).to(device=self.device, dtype=dtype)
+            backward_transform_local = th.InverseRealVectorSHT(grid_desc, lmax=lmax, mmax=mmax, lmmax=lmmax).to(device=self.device, dtype=dtype)
+            backward_transform_dist = thd.DistributedInverseRealVectorSHT(grid_desc, lmax=lmax, mmax=mmax, lmmax=lmmax).to(device=self.device, dtype=dtype)
         else:
-            forward_transform_local = th.RealSHT(th.as_grid(grid, nlat=H, nlon=W), lmax=lmax, mmax=lmax).to(self.device)
-            backward_transform_local = th.InverseRealSHT(th.as_grid(grid, nlat=H, nlon=W), lmax=lmax, mmax=lmax).to(self.device)
-            backward_transform_dist = thd.DistributedInverseRealSHT(th.as_grid(grid, nlat=H, nlon=W), lmax=lmax, mmax=lmax).to(self.device)
+            forward_transform_local = None if oversized else th.RealSHT(grid_desc, lmax=lmax, mmax=mmax, lmmax=lmmax).to(device=self.device, dtype=dtype)
+            backward_transform_local = th.InverseRealSHT(grid_desc, lmax=lmax, mmax=mmax, lmmax=lmmax).to(device=self.device, dtype=dtype)
+            backward_transform_dist = thd.DistributedInverseRealSHT(grid_desc, lmax=lmax, mmax=mmax, lmmax=lmmax).to(device=self.device, dtype=dtype)
 
         # create tensors
-        if vector:
-            dummy_full = torch.randn((B, C, 2, H, W), dtype=torch.float32, device=self.device)
+        if forward_transform_local is not None:
+            dummy_full = torch.randn((B, C, *((2,) if vector else ()), *grid_desc.shape), dtype=dtype, device=self.device)
+            inp_full = forward_transform_local(dummy_full)
         else:
-            dummy_full = torch.randn((B, C, H, W), dtype=torch.float32, device=self.device)
-        inp_full = forward_transform_local(dummy_full)
+            # This is an inverse-only upsampling case; generate coefficients directly
+            # so it does not invoke forward analysis beyond the latitude recovery limit.
+            complex_dtype = torch.complex128 if dtype == torch.float64 else torch.complex64
+            shape = (B, C, 2, lmax, mmax) if vector else (B, C, lmax, mmax)
+            inp_full = torch.randn(shape, dtype=complex_dtype, device=self.device)
+            inp_full[..., 0] = inp_full[..., 0].real
+            if vector:
+                inp_full[..., 0, :] = 0
 
         #############################################################
         # local transform
@@ -397,7 +535,7 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
         out_local = backward_transform_dist(inp_local)
 
         # BWD pass
-        ograd_local = self._split_helper(ograd_full)
+        ograd_local = self._split_spatial(ograd_full, backward_transform_dist)
         out_local = backward_transform_dist(inp_local)
         out_local.backward(ograd_local)
         igrad_local = inp_local.grad.clone()
@@ -408,16 +546,12 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
 
         # evaluate FWD pass
         out_gather_full = self._gather_helper_bwd(out_local, backward_transform_dist)
-        if verbose:
-            _report_margin("output", out_full, out_gather_full, atol, rtol)
-        ok = compare_tensors("output", out_full, out_gather_full, atol=_range_atol(out_full, atol), rtol=rtol, verbose=verbose)
+        ok = compare_tensors("output", out_gather_full, out_full, atol=atol, rtol=rtol, verbose=verbose, ulps=8, report=verbose)
         self.assertTrue(reduce_success(ok, self.device), "output")
 
         # evaluate BWD pass
         igrad_gather_full = self._gather_helper_fwd(igrad_local, backward_transform_dist)
-        if verbose:
-            _report_margin("gradients", igrad_full, igrad_gather_full, atol, rtol)
-        ok = compare_tensors("gradients", igrad_full, igrad_gather_full, atol=_range_atol(igrad_full, atol), rtol=rtol, verbose=verbose)
+        ok = compare_tensors("gradients", igrad_gather_full, igrad_full, atol=atol, rtol=rtol, verbose=verbose, ulps=8, report=verbose)
         self.assertTrue(reduce_success(ok, self.device), "gradients")
 
     @parameterized.expand(
@@ -430,10 +564,14 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
             [32, 64, None, "equiangular", True],
             [33, 64, None, "legendre-gauss", True],
             [32, 64, 8, "equiangular", True],
+            [32, 64, 24, "legendre-gauss", False, 9, 6],
+            [32, 64, 24, "legendre-gauss", True, 9, 6],
+            [33, 64, None, "fejer1", False],
+            [32, 64, None, "fejer1", True],
         ],
         skip_on_empty=True,
     )
-    def test_legendre_blocks(self, nlat, nlon, lmax, grid, vector, verbose=False):
+    def test_legendre_blocks(self, nlat, nlon, lmax, grid, vector, mmax=None, lmmax=None, verbose=False):
         """Each rank's precomputed Legendre buffer equals its slice of the serial one.
 
         The distributed transforms build only the block they keep rather than the whole
@@ -452,19 +590,26 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
         """
 
         set_seed(333)
+        mmax = lmax if mmax is None else mmax
 
         if vector:
-            fwd_dist = thd.DistributedRealVectorSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=lmax).to(self.device)
-            fwd_local = th.RealVectorSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=lmax).to(self.device)
-            inv_dist = thd.DistributedInverseRealVectorSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=lmax).to(self.device)
-            inv_local = th.InverseRealVectorSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=lmax).to(self.device)
+            fwd_dist = thd.DistributedRealVectorSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=mmax, lmmax=lmmax).to(self.device)
+            fwd_local = th.RealVectorSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=mmax, lmmax=lmmax).to(self.device)
+            inv_dist = thd.DistributedInverseRealVectorSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=mmax, lmmax=lmmax).to(self.device)
+            inv_local = th.InverseRealVectorSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=mmax, lmmax=lmmax).to(self.device)
             fwd_buf, inv_buf = "weights", "dpct"
         else:
-            fwd_dist = thd.DistributedRealSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=lmax).to(self.device)
-            fwd_local = th.RealSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=lmax).to(self.device)
-            inv_dist = thd.DistributedInverseRealSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=lmax).to(self.device)
-            inv_local = th.InverseRealSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=lmax).to(self.device)
+            fwd_dist = thd.DistributedRealSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=mmax, lmmax=lmmax).to(self.device)
+            fwd_local = th.RealSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=mmax, lmmax=lmmax).to(self.device)
+            inv_dist = thd.DistributedInverseRealSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=mmax, lmmax=lmmax).to(self.device)
+            inv_local = th.InverseRealSHT(th.as_grid(grid, nlat=nlat, nlon=nlon), lmax=lmax, mmax=mmax, lmmax=lmmax).to(self.device)
             fwd_buf, inv_buf = "weights", "pct"
+
+        spectral_grid = th.truncate_sht(fwd_dist.grid, lmax, mmax, lmmax)
+        self.assertIs(fwd_dist.grid_in, fwd_dist.grid)
+        self.assertEqual(fwd_dist.grid_out, spectral_grid)
+        self.assertEqual(inv_dist.grid_in, spectral_grid)
+        self.assertIs(inv_dist.grid_out, inv_dist.grid)
 
         # offsets are recomputed here from the per-rank shape lists rather than read off the
         # transform, so a wrong offset in the construction is not masked by reusing it
@@ -494,6 +639,191 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
         ok = compare_tensors("inverse legendre block", got, ref.contiguous(), atol=1e-14, rtol=1e-14, verbose=verbose)
         self.assertTrue(reduce_success(ok, self.device), "inverse legendre block")
 
+    @parameterized.expand([["DistributedRealSHT"], ["DistributedRealVectorSHT"]])
+    def test_distributed_forward_rejects_oversized_gauss_degree(self, cls_name):
+        """The distributed constructors validate on their own, so they are guarded separately."""
+        grid = th.as_grid("legendre-gauss", nlat=8, nlon=16)
+        lmax = grid.max_recoverable_degree + 1
+        mmax = min(lmax, grid.max_azimuthal_order)
+        with self.assertRaisesRegex(ValueError, "max_recoverable_degree"):
+            getattr(thd, cls_name)(grid, lmax=lmax, mmax=mmax)
 
-if __name__ == "__main__":
-    unittest.main()
+    @parameterized.expand(
+        [["DistributedRealSHT", "weights"], ["DistributedInverseRealSHT", "pct"], ["DistributedRealVectorSHT", "weights"], ["DistributedInverseRealVectorSHT", "dpct"]]
+    )
+    def test_identical_transforms_share_their_block(self, cls_name, buffer):
+        """
+        Two identical distributed transforms hold one copy of this rank's block, and it is
+        the block a transform of different bounds does not get; see torch_harmonics.cache.
+        """
+        grid = th.as_grid("legendre-gauss", nlat=16, nlon=32)
+        cls = getattr(thd, cls_name)
+        a = cls(grid, block_size=3).to(self.device)
+        b = cls(grid, block_size=3).to(self.device)
+        other = cls(grid, lmax=10, mmax=10, block_size=3).to(self.device)
+        tables = [getattr(a, name) for name in a._block_names]
+        self.assertEqual([name.rsplit("_", 1)[0] for name in a._block_names], [buffer] * len(tables))
+        self.assertGreater(len(tables), 1)
+        for name, table in zip(a._block_names, tables):
+            self.assertIs(getattr(b, name), table)
+        self.assertFalse(any(getattr(other, name) is table for name in other._block_names for table in tables))
+
+    @parameterized.expand(
+        [
+            # nlat, nlon, grid, vector, inverse
+            [33, 64, "equiangular", False, False],
+            [33, 64, "legendre-gauss", False, False],
+            [33, 64, "equiangular", True, False],
+            [33, 64, "equiangular", False, True],
+            [33, 64, "legendre-gauss", False, True],
+            [33, 64, "equiangular", True, True],
+        ],
+        skip_on_empty=True,
+    )
+    def test_distributed_sht_double_backward(self, nlat, nlon, grid, vector, inverse, verbose=False):
+        """Gradient of the penalty |dL/dx|^2 through the distributed (inverse) SHT, against the serial one.
+
+        L is a cubic of the output, so its Hessian couples output points through the transform
+        and the penalty gradient crosses both all-to-all transposes. float64, on uneven splits.
+
+        No fp16/bf16 autocast cases: the layers that use the SHTs (e.g. SpectralConvS2) run
+        them with autocast disabled, and no SHT test covers autocast. The communication
+        under autocast is covered by the primitive tests in test_distributed_primitives.py.
+        """
+        self._check_distributed_sht_double_backward(th.as_grid(grid, nlat=nlat, nlon=nlon), vector, inverse, verbose)
+
+    def _check_distributed_sht_double_backward(self, grid, vector, inverse, verbose=False):
+        """The penalty gradient through the distributed (inverse) SHT on ``grid``, a grid descriptor, against the serial one."""
+        set_seed(333)
+        B, C = 2, 3
+        sht_cls = th.RealVectorSHT if vector else th.RealSHT
+        dist_cls = thd.DistributedRealVectorSHT if vector else thd.DistributedRealSHT
+        isht_cls = th.InverseRealVectorSHT if vector else th.InverseRealSHT
+        idist_cls = thd.DistributedInverseRealVectorSHT if vector else thd.DistributedInverseRealSHT
+        sht_local = sht_cls(grid).to(device=self.device, dtype=torch.float64)
+
+        inp_full = torch.randn((B, C, *((2,) if vector else ()), *grid.shape), dtype=torch.float64, device=self.device)
+        if inverse:
+            inp_full = sht_local(inp_full).detach()
+            transform_local = isht_cls(grid).to(device=self.device, dtype=torch.float64)
+            transform_dist = idist_cls(grid).to(device=self.device, dtype=torch.float64)
+            inp_local, gather_inp = self._split_helper(inp_full), self._gather_helper_fwd
+        else:
+            transform_local = sht_local
+            transform_dist = dist_cls(grid).to(device=self.device, dtype=torch.float64)
+            inp_local, gather_inp = self._split_spatial(inp_full, transform_dist), self._gather_helper_bwd
+
+        def sq_norm(t):
+            return torch.sum(torch.view_as_real(t) ** 2) if t.is_complex() else torch.sum(t * t)
+
+        def cube(t):
+            return torch.sum(torch.view_as_real(t) ** 3) if t.is_complex() else torch.sum(t**3)
+
+        def penalty_grads(transform, x, reduce_fn):
+            (g,) = torch.autograd.grad(reduce_fn(cube(transform(x))), x, create_graph=True)
+            (h,) = torch.autograd.grad(reduce_fn(sq_norm(g)), x)
+            return g.detach(), h
+
+        def reduce_hw(t):
+            return thd.reduce_from_azimuth_region(thd.reduce_from_polar_region(t))
+
+        g_full, h_full = penalty_grads(transform_local, inp_full.clone().requires_grad_(True), lambda t: t)
+        g_local, h_local = penalty_grads(transform_dist, inp_local.clone().requires_grad_(True), reduce_hw)
+
+        verbose = verbose and self.world_rank == 0
+        ok = compare_tensors("gradients", gather_inp(g_local, transform_dist), g_full, atol=0.0, rtol=0.0, ulps=8, verbose=verbose)
+        self.assertTrue(reduce_success(ok, self.device), "gradients")
+        ok = compare_tensors("penalty grad", gather_inp(h_local, transform_dist), h_full, atol=0.0, rtol=0.0, ulps=8, verbose=verbose)
+        self.assertTrue(reduce_success(ok, self.device), "penalty grad")
+
+    # -- HEALPix -------------------------------------------------------------------------
+    # The same checks as above on a HealpixGrid, row for row in the same order with nside in
+    # place of nlat, nlon and the grid name. The rings are split into bands of about equal pixel
+    # counts, so the synthesis reduce-scatter runs on ring counts that are not the natural
+    # split. HEALPix has no azimuth split, so these skip on an azimuth group of more than one
+    # rank. The float32 tolerances are those of the regular rows, see the note above them.
+
+    @parameterized.expand(
+        [
+            # nside, lmax, batch_size, num_chan, vector, atol, rtol, mmax, lmmax, dtype, iter
+            # lmax automatically determined, 2 * nside
+            [4, None, 2, 3, False, 1e-5, 1e-6],
+            [8, None, 2, 3, False, 1e-5, 1e-6],
+            [8, None, 2, 3, True, 1e-5, 1e-6],
+            # fewer channels than the polar group size, see the regular rows
+            [8, None, 1, 1, False, 1e-5, 1e-5],
+            [8, None, 1, 1, True, 1e-5, 1e-5],
+            # downsampling, and the largest degree HEALPix accepts, 3 * nside
+            [8, 8, 2, 3, False, 1e-5, 1e-6],
+            [8, 24, 2, 3, False, 1e-5, 1e-6],
+            [8, 24, 2, 3, True, 1e-5, 1e-6],
+            # asymmetric truncation
+            [8, 16, 1, 4, False, 1e-5, 1e-6, 9, None],
+            [8, 16, 1, 4, False, 1e-5, 1e-6, None, 5],
+            [8, 16, 1, 4, True, 1e-5, 1e-6, 9, 5],
+            # float64
+            [8, None, 2, 3, False, 1e-12, 1e-12, None, None, torch.float64],
+            [8, 24, 2, 3, True, 1e-12, 1e-12, None, None, torch.float64],
+            # Jacobi iterations, each a distributed synthesis and analysis more
+            [8, None, 2, 3, False, 1e-12, 1e-12, None, None, torch.float64, 2],
+            [8, None, 2, 3, True, 1e-12, 1e-12, None, None, torch.float64, 2],
+        ],
+        skip_on_empty=True,
+    )
+    def test_distributed_sht_healpix(self, nside, lmax, batch_size, num_chan, vector, atol, rtol, mmax=None, lmmax=None, dtype=torch.float32, iter=0, verbose=True):
+        if self.grid_size_w > 1:
+            self.skipTest("HEALPix decomposes along latitude only")
+        self._check_distributed_sht(th.HealpixGrid(nside=nside), lmax, batch_size, num_chan, vector, atol, rtol, mmax, lmmax, dtype, verbose, iter=iter)
+
+    @parameterized.expand(
+        [
+            # nside, lmax, batch_size, num_chan, vector, atol, rtol, mmax, lmmax, dtype
+            [4, None, 2, 3, False, 1e-5, 1e-6],
+            [8, None, 2, 3, False, 1e-5, 1e-6],
+            [8, None, 2, 3, True, 1e-5, 1e-6],
+            [8, None, 1, 1, False, 1e-5, 1e-5],
+            [8, None, 1, 1, True, 1e-5, 1e-5],
+            [8, 8, 2, 3, False, 1e-5, 1e-6],
+            [8, 24, 2, 3, False, 1e-5, 1e-6],
+            [8, 24, 2, 3, True, 1e-5, 1e-6],
+            [8, 16, 1, 4, False, 1e-5, 1e-6, 9, None],
+            [8, 16, 1, 4, False, 1e-5, 1e-6, None, 5],
+            [8, 16, 1, 4, True, 1e-5, 1e-6, 9, 5],
+            [8, None, 2, 3, False, 1e-12, 1e-12, None, None, torch.float64],
+            [8, 24, 2, 3, True, 1e-12, 1e-12, None, None, torch.float64],
+        ],
+        skip_on_empty=True,
+    )
+    def test_distributed_isht_healpix(self, nside, lmax, batch_size, num_chan, vector, atol, rtol, mmax=None, lmmax=None, dtype=torch.float32, verbose=True):
+        if self.grid_size_w > 1:
+            self.skipTest("HEALPix decomposes along latitude only")
+        self._check_distributed_isht(th.HealpixGrid(nside=nside), lmax, batch_size, num_chan, vector, atol, rtol, mmax, lmmax, dtype, verbose)
+
+    @parameterized.expand(
+        [
+            # nside, vector, inverse
+            [8, False, False],
+            [8, True, False],
+            [8, False, True],
+            [8, True, True],
+        ],
+        skip_on_empty=True,
+    )
+    def test_distributed_sht_healpix_double_backward(self, nside, vector, inverse, verbose=False):
+        """
+        The penalty gradient through the distributed (inverse) SHT on HEALPix, see test_distributed_sht_double_backward.
+
+        The synthesis reduce-scatter splits the rings by pixel count, not evenly, and its adjoint
+        is an all-gather whose own adjoint must scatter back by the same shapes.
+        """
+        if self.grid_size_w > 1:
+            self.skipTest("HEALPix decomposes along latitude only")
+        self._check_distributed_sht_double_backward(th.HealpixGrid(nside=nside), vector, inverse, verbose)
+
+    @parameterized.expand([[name] for name in ("DistributedRealSHT", "DistributedInverseRealSHT", "DistributedRealVectorSHT", "DistributedInverseRealVectorSHT")])
+    def test_healpix_refuses_an_azimuthal_decomposition(self, cls_name):
+        """Rings differ in length, so there is no longitude axis to split: the transform says so at construction."""
+        if self.grid_size_w == 1:
+            self.skipTest("needs an azimuth group of more than one rank")
+        with self.assertRaises(NotImplementedError):
+            getattr(thd, cls_name)(th.HealpixGrid(nside=8))

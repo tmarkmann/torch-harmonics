@@ -35,6 +35,7 @@ import os
 import unittest
 from dataclasses import dataclass
 from typing import ClassVar
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -108,7 +109,30 @@ def set_seed(seed=333):
     return
 
 
+def float64_buffers(module):
+    """Names of the module's float64 buffers."""
+    return [name for name, b in module.named_buffers() if b.dtype == torch.float64]
+
+
+def move_as_to_mps(module):
+    """Move ``module`` to the CPU as if the CPU were a device without float64, such as MPS.
+
+    A module that keeps float64 weights downcasts them to float32 on such a move; any other
+    move leaves them alone.
+    """
+    with mock.patch("torch_harmonics.utils._NO_FLOAT64_DEVICE_TYPES", frozenset({"cpu"})):
+        return module.to("cpu")
+
+
 def disable_tf32():
+    """
+    Compute float32 matmuls and convolutions in IEEE float32 rather than TF32.
+
+    conftest.py calls this once per session, before any test runs, so every test runs
+    without TF32 whatever its order or the container's default. Individual tests do not
+    need to call it. The suite is run with pytest; a test file run directly would not
+    load conftest.py.
+    """
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.fp32_precision = "ieee"
         torch.backends.cudnn.fp32_precision = "ieee"
@@ -133,13 +157,32 @@ def maybe_autocast(device_type, dtype):
         yield
 
 
+def world_rank() -> int:
+    """Rank of this test process.
+
+    Read from WORLD_RANK, which CI and tests/run_tests.sh set, or else from RANK, which
+    torchrun sets; 0 when neither is set, as in a serial run. The distributed setup below
+    and the output silencing in conftest.py both use this, so they always agree.
+    """
+    rank = os.getenv("WORLD_RANK")
+    if rank is None:
+        rank = os.getenv("RANK", 0)
+    return int(rank)
+
+
 def setup_distributed_context(ctx):
-    ctx.world_rank = int(os.getenv("WORLD_RANK", 0))
+    ctx.world_rank = world_rank()
     ctx.grid_size_h = int(os.getenv("GRID_H", 1))
     ctx.grid_size_w = int(os.getenv("GRID_W", 1))
     port = int(os.getenv("MASTER_PORT", "29501"))
     master_address = os.getenv("MASTER_ADDR", "localhost")
     ctx.world_size = ctx.grid_size_h * ctx.grid_size_w
+
+    # A launcher that sets WORLD_SIZE (torchrun, run_tests.sh) must start exactly one
+    # process per grid cell; otherwise the process group can never form.
+    launched = os.getenv("WORLD_SIZE")
+    if launched is not None and int(launched) != ctx.world_size:
+        raise RuntimeError(f"WORLD_SIZE={launched} processes were launched, but GRID_H * GRID_W = {ctx.world_size}")
 
     if torch.cuda.is_available():
         if ctx.world_rank == 0:
@@ -341,7 +384,94 @@ def reduce_success(success, device, group=None):
     return bool(flag.item())
 
 
-def compare_tensors(msg, tensor1, tensor2, atol=1e-8, rtol=1e-5, verbose=False):
+def tests_verbosity():
+    """
+    The level set by TORCH_HARMONICS_TESTS_VERBOSE, which overrides the tests' own ``verbose``:
+
+    - 0 (default): each test decides.
+    - 1: every compare_tensors check prints its diagnostics when it fails.
+    - 2: every floating-point check also prints its margin when it passes, in ULPs of
+      max|ref|, so the tolerances can be calibrated from a run on a given machine.
+
+    Read on each call, so it can be set per test. Under torch.distributed only rank 0 prints,
+    as the tests' own diagnostics do; the verdict is all-reduced separately (reduce_success).
+    """
+    level = int(os.getenv("TORCH_HARMONICS_TESTS_VERBOSE", "0"))
+    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        return 0
+    return level
+
+
+def _eps(tensor, eps_dtype=None):
+    if eps_dtype is None:
+        eps_dtype = tensor.real.dtype if tensor.is_complex() else tensor.dtype
+    return torch.finfo(eps_dtype).eps
+
+
+def range_atol(ref, atol, ulps, eps_dtype=None):
+    """
+    ``atol``, raised to ``ulps`` ULPs of the largest entry of ``ref``.
+
+    The rounding error of a reduction (a parameter gradient summed over batch and grid, a
+    distributed sum reassociated across ranks) scales with the size of the terms it sums, not
+    with the value it lands on: an entry that cancels to ~0 carries the same absolute error as
+    its largest neighbours. A fixed atol cannot express that without being either too tight for
+    large-valued tensors or meaninglessly loose for O(1) ones, and an rtol does not help at all
+    near the cancelled entries. ``max|ref|`` is the cheap proxy for the size of those terms.
+
+    ``eps_dtype`` is the precision the reduction ran in, which under autocast is not the dtype
+    of the tensor being compared (fp32 parameter gradients accumulated from bf16 products).
+    """
+    if ref.numel() == 0:
+        return atol
+    return max(atol, ulps * _eps(ref, eps_dtype) * ref.abs().max().item())
+
+
+def amp_ulps(dtype):
+    """
+    ULP budget (for ``compare_tensors(atol=0, rtol=0, ulps=..., eps_dtype=dtype)``) of a result
+    computed under autocast in ``dtype``, 0 for any other dtype.
+
+    Autocast rounds the operands, and usually the result, to fp16/bf16 and accumulates in
+    fp32, so two implementations of the same contraction (serial and distributed, or two
+    kernels) differ by about one rounding in the autocast dtype, at most ~1 ULP of the
+    largest entry, independent of the size of the reduction. Measured on GB200 and CPU across
+    distributed DISCO and attention, outputs and input and parameter gradients: up to 0.83.
+    """
+    return 2.0 if dtype in (torch.float16, torch.bfloat16) else 0.0
+
+
+def param_grad_ulps(n_reduce, dtype):
+    """
+    ULP budget (for ``compare_tensors(ulps=..., eps_dtype=dtype)``) of a parameter gradient
+    that sums ``n_reduce`` terms, e.g. batch x grid points.
+
+    - fp32/fp64: the error is accumulation order, and the rounding of an N-term sum grows like
+      sqrt(N) eps. Measured across the distributed DISCO grids: up to ~0.3 sqrt(N). Floored at
+      64 ULPs for the small reductions, where comparisons against a different algorithm (a
+      dense oracle, a torch reference) are dominated by the per-term rounding instead.
+    - fp16/bf16 under autocast: the error is the rounding of the low-precision operands, which
+      are accumulated in fp32, so it does not grow with N. Measured: up to ~0.6 ULPs of the
+      autocast dtype.
+    """
+    if dtype in (torch.float16, torch.bfloat16):
+        return amp_ulps(dtype)
+    return max(64.0, math.sqrt(n_reduce))
+
+
+def compare_tensors(msg, tensor1, tensor2, atol=1e-8, rtol=1e-5, verbose=False, ulps=0, eps_dtype=None, report=False):
+    """
+    ``torch.allclose(tensor1, tensor2, atol, rtol)`` with diagnostics. ``tensor2`` is the reference.
+
+    ``ulps > 0`` floors atol at ``ulps`` ULPs (of ``eps_dtype``, default the reference's) of
+    ``max|tensor2|``, see range_atol. ``report`` prints the error in those units even when the
+    check passes, to calibrate a budget against. TORCH_HARMONICS_TESTS_VERBOSE=1 forces
+    ``verbose`` and =2 also ``report``, see tests_verbosity.
+    """
+
+    level = tests_verbosity()
+    verbose = verbose or level >= 1
+    report = report or level >= 2
 
     # some None checks
     if tensor1 is None and tensor2 is None:
@@ -365,6 +495,9 @@ def compare_tensors(msg, tensor1, tensor2, atol=1e-8, rtol=1e-5, verbose=False):
             first = int(mismatch.nonzero()[0])
             print(f"{int(mismatch.sum())} mismatching elements on {msg}, first at flat index {first}: {tensor1.flatten()[first]} and {tensor2.flatten()[first]}")
     else:
+        # ulps > 0 floors atol at a multiple of the reference's range, see range_atol
+        if ulps > 0:
+            atol = range_atol(tensor2, atol, ulps, eps_dtype=eps_dtype)
         diff = torch.abs(tensor1 - tensor2)
         abs_diff = torch.mean(diff, dim=0)
         rel_diff = torch.mean(diff / torch.clamp(torch.abs(tensor2), min=1e-6), dim=0)
@@ -378,6 +511,12 @@ def compare_tensors(msg, tensor1, tensor2, atol=1e-8, rtol=1e-5, verbose=False):
             diff_bad = diff.flatten()[worst_diff].item()
             tensor2_abs_bad = torch.abs(tensor2).flatten()[worst_diff].item()
             print(f"Worst allclose condition violation: {diff_bad} <= {atol} + {rtol} * {tensor2_abs_bad} = {atol + rtol * tensor2_abs_bad}")
+        if (not allclose and verbose) or report:
+            # in the units range_atol calibrates in, so a ulps budget can be set from the output
+            scale = torch.abs(tensor2).max().item() if tensor2.numel() > 0 else 0.0
+            max_diff = diff.max().item() if diff.numel() > 0 else 0.0
+            ulps_seen = max_diff / max(_eps(tensor2, eps_dtype) * scale, 1e-30)
+            print(f"Margin on {msg}: max|diff| = {max_diff:.3e}, max|ref| = {scale:.3e}, {ulps_seen:.1f} ULPs of max|ref| (atol {atol:.1e}, rtol {rtol:.1e}, ulps {ulps:g})")
 
     return allclose
 

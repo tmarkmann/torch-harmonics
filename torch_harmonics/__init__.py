@@ -42,6 +42,7 @@ from .attention import AttentionS2, NeighborhoodAttentionS2
 from .disco import DiscreteContinuousConvS2, DiscreteContinuousConvTransposeS2
 from .grid import (
     EquiangularGrid,
+    Fejer1Grid,
     GridS2,
     GridShardS2,
     LegendreGaussGrid,
@@ -49,6 +50,7 @@ from .grid import (
     PointSetS2,
     RegularGridS2,
     RegularGridShardS2,
+    SpectralGrid,
     TrapezoidalGrid,
     as_grid,
     grid_params,
@@ -57,7 +59,7 @@ from .grid import (
     require_point_set,
     require_regular_grid,
 )
-from .healpix import HealpixGrid
+from .healpix import HealpixGrid, HealpixGridShardS2
 from .integration import QuadratureS2, QuadratureVolume
 from .neighborhood import NeighborhoodArcsS2, precompute_neighborhood_arcs_s2, precompute_neighborhood_csr_s2
 from .radial import GeometricRadialGrid, LegendreGaussRadialGrid, RadialGrid, SphericalProductGrid, as_radial_grid, radial_grid_types

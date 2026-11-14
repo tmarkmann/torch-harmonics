@@ -31,11 +31,18 @@
 
 import math
 import unittest
+from fractions import Fraction
 
 import torch
 from parameterized import parameterized
 
-from torch_harmonics.filter_basis import get_filter_basis
+from torch_harmonics.filter_basis import (
+    FourierBesselFilterBasis,
+    HarmonicFilterBasis,
+    PiecewiseLinearFilterBasis,
+    ZernikeFilterBasis,
+    get_filter_basis,
+)
 
 
 # quadrature grid on the disk for integration tests
@@ -56,6 +63,15 @@ def _eval_dense(basis, r, phi, r_cutoff):
     with torch.sparse.check_sparse_tensor_invariants(enable=False):
         psi = torch.sparse_coo_tensor(iidx.t(), vals, size=(basis.kernel_size, nr, nphi)).to_dense()
     return psi
+
+
+def _zernike_radial_exact(n, m, r):
+    """R_n^m(r) from its closed-form sum, in exact rational arithmetic."""
+    total = Fraction(0)
+    for k in range((n - m) // 2 + 1):
+        coefficient = Fraction(math.factorial(n - k), math.factorial(k) * math.factorial((n + m) // 2 - k) * math.factorial((n - m) // 2 - k))
+        total += (-1) ** k * coefficient * r ** (n - 2 * k)
+    return total
 
 
 class TestFilterBasis(unittest.TestCase):
@@ -252,11 +268,70 @@ class TestFilterBasis(unittest.TestCase):
     # ------------------------------------------------------------------
     # Zernike: R_n^m(1) = 1 for all (n, m)
     # ------------------------------------------------------------------
+    @parameterized.expand([[n, m] for n in (6, 8, 12, 16, 20) for m in range(n % 2, n + 1, 2)], skip_on_empty=True)
+    def test_zernike_radial_matches_closed_form(self, n, m, tol=1e-10):
+        """R_n^m against the closed-form sum evaluated in rational arithmetic."""
+        basis = get_filter_basis(kernel_shape=(n + 1,), basis_type="zernike")
+        nodes = [Fraction(i, 16) for i in range(17)]
+        expected = [float(_zernike_radial_exact(n, m, node)) for node in nodes]
+        r = torch.tensor([float(node) for node in nodes], dtype=torch.float64)
+        degree, order = torch.full_like(r, n, dtype=torch.int64), torch.full_like(r, m, dtype=torch.int64)
+
+        actual = basis.zernikeradial(r, degree, order)
+
+        self.assertLess((actual - torch.tensor(expected, dtype=torch.float64)).abs().max().item(), tol)
+
+    def test_zernike_radial_broadcasts_degree_and_order(self, n=6, m=2, tol=1e-10):
+        """One (n, m) pair at several radii, as one-element or zero-dimensional tensors."""
+        basis = get_filter_basis(kernel_shape=(n + 1,), basis_type="zernike")
+        nodes = [Fraction(i, 16) for i in range(17)]
+        r = torch.tensor([float(node) for node in nodes], dtype=torch.float64)
+        expected = torch.tensor([float(_zernike_radial_exact(n, m, node)) for node in nodes], dtype=torch.float64)
+        for degree, order in [(torch.tensor([n]), torch.tensor([m])), (torch.tensor(n), torch.tensor(m))]:
+            actual = basis.zernikeradial(r, degree, order)
+            self.assertEqual(actual.shape, r.shape)
+            self.assertLess((actual - expected).abs().max().item(), tol)
+
+    @parameterized.expand([[4], [7], [10]])
+    def test_zernike_poly_matches_closed_form(self, kernel_shape, tol=1e-10):
+        """Every basis function of one call at once, with both the cosine and the sine branch, against the closed form."""
+        basis = get_filter_basis(kernel_shape=(kernel_shape,), basis_type="zernike")
+        generator = torch.Generator().manual_seed(333)
+        npoints = 20
+        r = torch.rand(npoints, dtype=torch.float64, generator=generator)
+        phi = 2 * math.pi * torch.rand(npoints, dtype=torch.float64, generator=generator)
+        # one entry per (basis function, point), as compute_support_vals lays them out
+        n = torch.tensor([i for i in range(kernel_shape) for _ in range(i + 1) for _ in range(npoints)])
+        l = torch.tensor([j for i in range(kernel_shape) for j in range(i + 1) for _ in range(npoints)])
+        r, phi = r.repeat(basis.kernel_size), phi.repeat(basis.kernel_size)
+        actual = basis.zernikepoly(r, phi, n, l)
+
+        expected = []
+        for ni, li, ri, pi in zip(n.tolist(), l.tolist(), r.tolist(), phi.tolist()):
+            mi = 2 * li - ni
+            radial = float(_zernike_radial_exact(ni, abs(mi), Fraction(ri)))
+            expected.append(radial * (math.sin(mi * pi) if mi < 0 else math.cos(mi * pi)))
+        self.assertLess((actual - torch.tensor(expected, dtype=torch.float64)).abs().max().item(), tol)
+
+    @parameterized.expand([[torch.float16], [torch.bfloat16]])
+    def test_zernike_radial_in_low_precision(self, dtype, tol=5e-2):
+        """The factorials stay at least float32: 9! overflows float16, and 9! / 9! must not become inf / inf."""
+        basis = get_filter_basis(kernel_shape=(11,), basis_type="zernike")
+        for n, m in [(9, 9), (9, 1), (10, 2), (10, 0)]:
+            for node in (Fraction(1, 2), Fraction(1)):
+                r = torch.tensor([float(node)], dtype=dtype)
+                actual = basis.zernikeradial(r, torch.tensor([n]), torch.tensor([m]))
+                self.assertTrue(bool(torch.isfinite(actual).all()), msg=f"R_{n}^{m}({node}) in {dtype}")
+                self.assertLess(abs(actual.item() - float(_zernike_radial_exact(n, m, node))), tol, msg=f"R_{n}^{m}({node}) in {dtype}")
+
     @parameterized.expand(
         [
             [(3,)],
             [(4,)],
             [(5,)],
+            [(9,)],
+            [(13,)],
+            [(21,)],
         ],
         skip_on_empty=True,
     )
@@ -351,5 +426,40 @@ class TestFilterBasis(unittest.TestCase):
         self.assertEqual(len(basis.isotropic_mask), basis.kernel_size)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestFilterBasisEquality(unittest.TestCase):
+    """Bases compare and hash by what defines them, not by identity: psi is shared by that key."""
+
+    @parameterized.expand(
+        [
+            [PiecewiseLinearFilterBasis, (3, 2)],
+            [HarmonicFilterBasis, (2, 3)],
+            [ZernikeFilterBasis, 4],
+            [FourierBesselFilterBasis, 5],
+        ]
+    )
+    def test_bases_built_alike_are_equal(self, cls, kernel_shape):
+        a, b = cls(kernel_shape=kernel_shape), cls(kernel_shape=kernel_shape)
+        self.assertIsNot(a, b)
+        self.assertEqual(a, b)
+        self.assertEqual(hash(a), hash(b))
+        self.assertEqual(len({a, b}), 1)
+
+    def test_equivalent_kernel_shapes_are_equal(self):
+        """Spellings each basis normalizes to the same shape give the same basis."""
+        self.assertEqual(PiecewiseLinearFilterBasis(3), PiecewiseLinearFilterBasis((3, 1)))
+        self.assertEqual(HarmonicFilterBasis(3), HarmonicFilterBasis([3, 3]))
+        self.assertEqual(ZernikeFilterBasis(4), ZernikeFilterBasis((4,)))
+
+    def test_bases_that_differ_are_not_equal(self):
+        self.assertNotEqual(PiecewiseLinearFilterBasis((3, 2)), PiecewiseLinearFilterBasis((3, 3)))
+        # the same kernel shape, but a different family of functions
+        self.assertNotEqual(ZernikeFilterBasis(4), FourierBesselFilterBasis(4))
+        self.assertNotEqual(PiecewiseLinearFilterBasis(3), "piecewise linear")
+
+    def test_normalization_is_part_of_the_basis(self):
+        """'morlet' is the unnormalized harmonic basis: other values, so not equal."""
+        self.assertNotEqual(HarmonicFilterBasis(3), HarmonicFilterBasis(3, normalize=False))
+        with self.assertWarns(DeprecationWarning):
+            morlet = get_filter_basis(kernel_shape=(3, 3), basis_type="morlet")
+        self.assertNotEqual(get_filter_basis(kernel_shape=(3, 3), basis_type="harmonic"), morlet)
+        self.assertEqual(morlet, HarmonicFilterBasis(3, normalize=False))

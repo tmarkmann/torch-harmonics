@@ -76,6 +76,79 @@ class TestGaussianRandomFieldS2(unittest.TestCase):
         self.assertEqual(field.gaussian_noise.loc.dtype, field.mean.dtype)
         self.assertEqual(field.gaussian_noise.loc.device, field.mean.device)
 
+    @parameterized.expand(
+        [
+            [torch.float64, torch.float32, 3.0, 1.0],
+            [torch.float32, torch.float64, 3.0, 1.0],
+            [torch.float64, torch.float32, 1e20, 1.0],
+            [torch.float64, torch.float32, 3.0, 1e-12],
+        ]
+    )
+    def test_spectral_amplitudes_are_computed_in_requested_dtype(self, dtype, default_dtype, tau, radius):
+        previous = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(default_dtype)
+            field = GaussianRandomFieldS2(as_grid("equiangular", nlat=8, nlon=16), dtype=dtype, tau=tau, radius=radius, sigma=1.0).to(self.device)
+        finally:
+            torch.set_default_dtype(previous)
+        self.assertEqual(field.sqrt_eig.dtype, dtype)
+        degrees = torch.arange(field.isht.lmax, device=self.device, dtype=torch.float64)
+        expected = (degrees * (degrees + 1) / radius**2 + tau**2).reciprocal()
+        expected[0] = 0.0
+        expected = torch.tril(expected[:, None].expand(-1, field.isht.mmax))
+        expected[:, 1:] /= 2.0**0.5
+        expected = expected.unsqueeze(0).to(dtype)
+        tolerance = 1e-13 if dtype == torch.float64 else 2e-6
+        torch.testing.assert_close(field.sqrt_eig, expected, rtol=tolerance, atol=0)
+        xi = torch.ones((2, field.isht.lmax, field.isht.mmax), dtype=torch.complex128 if dtype == torch.float64 else torch.complex64, device=self.device)
+        actual = field(2, xi=xi)
+        reference = field.isht(xi * expected)
+        self.assertEqual(actual.dtype, dtype)
+        self.assertTrue(bool(torch.isfinite(actual).all()))
+        self.assertGreater(float(actual.abs().max()), 0.0)
+        # the inverse SHT sums over every mode, so an entry that cancels carries an error set by
+        # the field's range rather than its own value
+        self.assertTrue(compare_tensors("field", actual, reference, atol=0.0, rtol=tolerance, ulps=64))
+
+    @parameterized.expand(
+        [
+            ("legendre-gauss", dict(nlat=24, nlon=48)),
+            ("legendre-gauss", dict(nlat=24, nlon=72)),
+            ("equiangular", dict(nlat=33, nlon=66)),
+            ("lobatto", dict(nlat=25, nlon=50)),
+            ("fejer1", dict(nlat=24, nlon=48)),
+            ("healpix", dict(nside=8)),
+        ]
+    )
+    def test_variance_is_independent_of_position(self, grid, params):
+        # A power spectrum C_l is rotation invariant, so the pointwise variance cannot depend on
+        # position. It is exact: the field is linear in the noise, so one unit per noise component,
+        # squared and summed, is the variance. On HEALPix the rings differ in length.
+        grid = as_grid(grid, **params)
+        field = GaussianRandomFieldS2(grid, alpha=1.5, tau=3.0, sigma=1.0, dtype=torch.float64).to(self.device)
+        lmax, mmax = field.isht.lmax, field.isht.mmax
+        count = 2 * lmax * mmax
+        noise = torch.eye(count, dtype=torch.float64, device=self.device).reshape(count, lmax, mmax, 2)
+        samples = field(count, xi=torch.view_as_complex(noise))
+        self.assertEqual(samples.shape, (count, *grid.shape))
+        variance = samples.pow(2).sum(dim=0)
+        spread = (variance.max() - variance.min()) / variance.mean()
+        self.assertLess(float(spread), 1e-10)
+
+    def test_float32_spectrum_preserves_representable_amplitudes_after_wide_intermediates(self):
+        field = GaussianRandomFieldS2(as_grid("equiangular", nlat=8, nlon=16), dtype=torch.float32, alpha=1.1, tau=1e20, sigma=1.0).to(self.device)
+        degree = torch.arange(field.isht.lmax, dtype=torch.float64, device=self.device)
+        expected = (degree * (degree + 1) + 1e40).pow(-0.55)
+        expected[0] = 0.0
+        expected = torch.tril(expected[:, None].expand(-1, field.isht.mmax))
+        expected[:, 1:] /= 2.0**0.5
+        expected = expected.unsqueeze(0).to(torch.float32)
+
+        self.assertEqual(field.sqrt_eig.dtype, torch.float32)
+        self.assertTrue(bool(torch.isfinite(field.sqrt_eig).all()))
+        self.assertGreater(float(field.sqrt_eig.abs().max()), 0.0)
+        torch.testing.assert_close(field.sqrt_eig, expected, rtol=2e-6, atol=0)
+
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA for a real device transfer")
     def test_sampler_follows_parent_cuda_and_cpu(self, verbose=False):
         field = GaussianRandomFieldS2(as_grid("equiangular", nlat=8, nlon=16))
@@ -261,7 +334,3 @@ class TestGaussianRandomFieldS2Probabilistic(unittest.TestCase):
             u_rough.var().item(),
             "Larger alpha should produce a smoother (lower-variance) field",
         )
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -35,7 +35,7 @@ from unittest import mock
 
 import torch
 from parameterized import parameterized, parameterized_class
-from testutils import _is_sm90, _is_sm100, _ProductGridAsRagged, compare_tensors, disable_tf32, maybe_autocast, requires_torch_compile, set_seed
+from testutils import _is_sm90, _is_sm100, _ProductGridAsRagged, compare_tensors, maybe_autocast, param_grad_ulps, requires_torch_compile, set_seed
 from torch.library import opcheck
 
 from torch_harmonics import DiscreteContinuousConvS2, DiscreteContinuousConvTransposeS2, HealpixGrid, as_grid
@@ -46,6 +46,7 @@ from torch_harmonics.disco.backends import RaggedOptimizedBackend, RaggedReferen
 from torch_harmonics.disco.convolution import (
     _precompute_convolution_tensor_s2,
 )
+from torch_harmonics.disco.optimized import disco_optimized
 from torch_harmonics.disco.optimized.disco_optimized import _kpacked_k_pad, _kpacked_supported_on_device
 from torch_harmonics.filter_basis import get_filter_basis
 from torch_harmonics.grid import RegularGridS2
@@ -54,6 +55,10 @@ from torch_harmonics.quadrature import compute_theta_cutoff, precompute_latitude
 if not optimized_kernels_is_available():
     print("Warning: Couldn't import optimized disco convolution kernels")
 
+
+# The layer's psi and the dense reference agree up to the float64 rounding of the basis
+# normalization, a sum over each kernel's support (measured: up to 17 ULPs of max|psi|).
+_PSI_ULPS = 64
 
 _devices = [(torch.device("cpu"),)]
 if torch.cuda.is_available():
@@ -257,9 +262,6 @@ def _precompute_convolution_tensor_dense(
 @parameterized_class(("device"), _devices)
 class TestDiscreteContinuousConvolution(unittest.TestCase):
     """Test the discrete-continuous convolution module (CPU/CUDA if available)."""
-
-    def setUp(self):
-        disable_tf32()
 
     @parameterized.expand(
         [
@@ -607,7 +609,7 @@ class TestDiscreteContinuousConvolution(unittest.TestCase):
                 psi = torch.sparse_coo_tensor(torch.stack([ker_idx, row_idx, col_idx]), vals, size=(conv.kernel_size, conv.nlat_in, conv.nlat_out * conv.nlon_out)).to_dense()
             psi = psi.to(self.device)
 
-            self.assertTrue(torch.allclose(psi, psi_dense[:, :, 0].reshape(-1, nlat_in, nlat_out * nlon_out)))
+            self.assertTrue(compare_tensors("psi", psi, psi_dense[:, :, 0].reshape(-1, nlat_in, nlat_out * nlon_out), atol=0.0, rtol=0.0, ulps=_PSI_ULPS))
         else:
             psi_dense = _precompute_convolution_tensor_dense(
                 in_shape,
@@ -626,7 +628,7 @@ class TestDiscreteContinuousConvolution(unittest.TestCase):
                 psi = torch.sparse_coo_tensor(torch.stack([ker_idx, row_idx, col_idx]), vals, size=(conv.kernel_size, conv.nlat_out, conv.nlat_in * conv.nlon_in)).to_dense()
             psi = psi.to(self.device)
 
-            self.assertTrue(torch.allclose(psi, psi_dense[:, :, 0].reshape(-1, nlat_out, nlat_in * nlon_in)))
+            self.assertTrue(compare_tensors("psi", psi, psi_dense[:, :, 0].reshape(-1, nlat_out, nlat_in * nlon_in), atol=0.0, rtol=0.0, ulps=_PSI_ULPS))
 
         # cast module to the target dtype for forward/backward
         if module_dtype != torch.float32:
@@ -667,7 +669,9 @@ class TestDiscreteContinuousConvolution(unittest.TestCase):
 
         # compare
         self.assertTrue(compare_tensors("input grad", x_grad.to(x_ref_grad.dtype), x_ref_grad, atol=atol, rtol=rtol, verbose=verbose))
-        self.assertTrue(compare_tensors("weight grad", conv.weight.grad.to(w_ref.grad.dtype), w_ref.grad, atol=atol, rtol=rtol, verbose=verbose))
+        # the weight gradient is a sum over batch and grid, see param_grad_ulps
+        pg_ulps = param_grad_ulps(batch_size * max(in_shape[0] * in_shape[1], out_shape[0] * out_shape[1]), dtype)
+        self.assertTrue(compare_tensors("weight grad", conv.weight.grad.to(w_ref.grad.dtype), w_ref.grad, atol=atol, rtol=rtol, verbose=verbose, ulps=pg_ulps, eps_dtype=dtype))
 
     @parameterized.expand(
         [
@@ -721,9 +725,9 @@ class TestDiscreteContinuousConvolution(unittest.TestCase):
             [8, 4, 2, (41, 80), (41, 80), (2, 2), "harmonic", "mean", "equiangular", "equiangular", torch.bfloat16, False, False, 3e-1, 1e-2],
             [8, 4, 2, (41, 80), (41, 80), (3, 3), "harmonic", "mean", "equiangular", "equiangular", torch.bfloat16, False, False, 3e-1, 1e-2],
             # 32 channels make the weight grad large (|w.grad| ~ 70, where one bf16 step is 0.5), so
-            # cancellation leaves near-zero entries ~2^-8 * 70 off in both paths: atol covers two roundings
-            # (0.3 failed by <1% on B200 and passed on H100/GB200, depending on accumulation order)
-            [8, 32, 32, (41, 80), (41, 80), (2, 2), "harmonic", "mean", "equiangular", "equiangular", torch.bfloat16, False, False, 6e-1, 5e-2],
+            # cancellation leaves near-zero entries ~2^-8 * 70 off in both paths; the weight grad's
+            # range-scaled atol (param_grad_ulps) covers that, the row tolerance does not need to
+            [8, 32, 32, (41, 80), (41, 80), (2, 2), "harmonic", "mean", "equiangular", "equiangular", torch.bfloat16, False, False, 3e-1, 5e-2],
             # transpose convolution
             [8, 4, 2, (41, 80), (41, 80), (3), "piecewise linear", "mean", "equiangular", "equiangular", torch.bfloat16, True, False, 3e-1, 1e-2],
             [8, 4, 2, (41, 80), (41, 80), (2, 2), "harmonic", "mean", "equiangular", "equiangular", torch.bfloat16, True, False, 3e-1, 1e-2],
@@ -841,11 +845,12 @@ class TestDiscreteContinuousConvolution(unittest.TestCase):
         inp_grad_opt = inp.grad.clone()
 
         # compare results
-        self.assertTrue(compare_tensors("output", out_naive, out_opt, atol=atol, rtol=rtol, verbose=verbose))
+        self.assertTrue(compare_tensors("output", out_opt, out_naive, atol=atol, rtol=rtol, verbose=verbose))
 
-        # compare
-        self.assertTrue(compare_tensors("input grad", inp_grad_naive, inp_grad_opt, atol=atol, rtol=rtol, verbose=verbose))
-        self.assertTrue(compare_tensors("weight grad", conv_naive.weight.grad, conv_opt.weight.grad, atol=atol, rtol=rtol, verbose=verbose))
+        # compare; the weight gradient is a sum over batch and grid, see param_grad_ulps
+        pg_ulps = param_grad_ulps(batch_size * max(nlat_in * nlon_in, nlat_out * nlon_out), dtype)
+        self.assertTrue(compare_tensors("input grad", inp_grad_opt, inp_grad_naive, atol=atol, rtol=rtol, verbose=verbose))
+        self.assertTrue(compare_tensors("weight grad", conv_opt.weight.grad, conv_naive.weight.grad, atol=atol, rtol=rtol, verbose=verbose, ulps=pg_ulps, eps_dtype=dtype))
 
     @parameterized.expand(
         [
@@ -906,16 +911,16 @@ class TestDiscreteContinuousConvolution(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [8, 4, 2, (16, 32), (16, 32), (3), "piecewise linear", "mean", "equiangular", "equiangular", False, 1e-4, 1e-4],
-            [8, 4, 2, (16, 32), (8, 16), (5), "piecewise linear", "mean", "legendre-gauss", "legendre-gauss", False, 1e-4, 1e-4],
-            [8, 4, 2, (16, 32), (16, 32), (3), "piecewise linear", "mean", "equiangular", "equiangular", True, 1e-4, 1e-4],
-            [8, 4, 2, (8, 16), (16, 32), (5), "piecewise linear", "mean", "legendre-gauss", "legendre-gauss", True, 1e-4, 1e-4],
+            [8, 4, 2, (16, 32), (16, 32), (3), "piecewise linear", "mean", "equiangular", "equiangular", False],
+            [8, 4, 2, (16, 32), (8, 16), (5), "piecewise linear", "mean", "legendre-gauss", "legendre-gauss", False],
+            [8, 4, 2, (16, 32), (16, 32), (3), "piecewise linear", "mean", "equiangular", "equiangular", True],
+            [8, 4, 2, (8, 16), (16, 32), (5), "piecewise linear", "mean", "legendre-gauss", "legendre-gauss", True],
         ],
         skip_on_empty=True,
     )
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is not available")
     def test_device_instantiation(
-        self, batch_size, in_channels, out_channels, in_shape, out_shape, kernel_shape, basis_type, basis_norm_mode, grid_in, grid_out, transpose, atol, rtol, verbose=False
+        self, batch_size, in_channels, out_channels, in_shape, out_shape, kernel_shape, basis_type, basis_norm_mode, grid_in, grid_out, transpose, verbose=False
     ):
 
         set_seed(333)
@@ -963,7 +968,7 @@ class TestDiscreteContinuousConvolution(unittest.TestCase):
         # since we specified the device specifier everywhere, it should always
         # use the cpu and it should be the same everywhere
         for name in ("psi_row_ker", "psi_row_lat", "psi_seg_off", "psi_seg", "psi_val_off", "psi_vals"):
-            self.assertTrue(compare_tensors(name, getattr(conv_host, name).cpu(), getattr(conv_device, name).cpu(), atol=atol, rtol=rtol, verbose=verbose))
+            self.assertTrue(compare_tensors(name, getattr(conv_device, name).cpu(), getattr(conv_host, name).cpu(), atol=0.0, rtol=0.0, verbose=verbose))
 
     @parameterized.expand(
         [
@@ -1180,7 +1185,7 @@ class TestDiscreteContinuousConvolution(unittest.TestCase):
 
 
 # A supported device is not sufficient: the kpacked buffers are only built when
-# this build actually contains the matching kernel (BUILD_KPACKED_SM90 / SM100,
+# this build actually contains the matching kernel (BUILD_KPACKED_SM90 / SM100 / SM103,
 # set from TORCH_CUDA_ARCH_LIST). A build targeting an architecture newer than
 # the ones with kpacked kernels reports e.g. major == 10 while carrying no
 # sm_100a cubin, so a device-only guard runs these tests against buffers that
@@ -1191,7 +1196,7 @@ def _kpacked_built_for_sm90():
 
 
 def _kpacked_built_for_sm100():
-    """Blackwell device AND an sm_100a kpacked kernel this device can load."""
+    """Blackwell device AND an sm_100a / sm_103a kpacked kernel this device can load."""
     return _is_sm100() and _kpacked_runnable_here()
 
 
@@ -1205,6 +1210,65 @@ def _kpacked_runnable_here():
 def _is_kpacked_supported():
     """Return True when the kpacked forward can actually run here (device AND build)."""
     return _kpacked_built_for_sm90() or _kpacked_built_for_sm100()
+
+
+class TestKpackedDeviceGate(unittest.TestCase):
+    """
+    The kpacked cubins are arch-conditional, not forward compatible: each device needs its
+    own build target, and a 10.0a-only build must not select kpacked on a 10.3 device, where
+    the forward silently returns zeros (#337). The build flags and the device capability are
+    mocked, so this runs without the hardware, and on every CI runner.
+    """
+
+    _TARGETS = {"9.0a": (9, 0), "10.0a": (10, 0), "10.3a": (10, 3)}
+    # the build flag behind each target, as the extension reports it
+    _FLAG_TARGET = {
+        disco_optimized.kpacked_sm90_kernels_is_available: "9.0a",
+        disco_optimized.kpacked_sm100_kernels_is_available: "10.0a",
+        disco_optimized.kpacked_sm103_kernels_is_available: "10.3a",
+    }
+
+    def _flags(self, built):
+        # mock the flags, not the table: each entry keeps the flag the library assigns it, so a
+        # device keyed on the wrong target (10.3 on the 10.0a flag, #337) is caught
+        table = disco_optimized._KPACKED_BUILT_FOR
+        return {capability: (lambda on=(self._FLAG_TARGET[flag] in built): on) for capability, flag in table.items()}
+
+    def _supported(self, built, capability):
+        with mock.patch.dict(disco_optimized._KPACKED_BUILT_FOR, self._flags(built)), mock.patch("torch.cuda.get_device_capability", return_value=capability):
+            return _kpacked_supported_on_device(0)
+
+    @parameterized.expand(
+        [
+            # build targets, device capability, kpacked selected
+            [("10.0a",), (10, 0), True],
+            [("10.0a",), (10, 3), False],
+            [("10.3a",), (10, 3), True],
+            [("10.3a",), (10, 0), False],
+            [("10.0a", "10.3a"), (10, 0), True],
+            [("10.0a", "10.3a"), (10, 3), True],
+            [("10.0a", "10.3a"), (9, 0), False],
+            [("9.0a",), (9, 0), True],
+            [("9.0a",), (10, 0), False],
+            # devices without a kpacked kernel: Rubin (10.7) is not a 10.0, nor are Ampere and RTX Blackwell
+            [("9.0a", "10.0a", "10.3a"), (10, 7), False],
+            [("9.0a", "10.0a", "10.3a"), (8, 0), False],
+            [("9.0a", "10.0a", "10.3a"), (12, 0), False],
+            [(), (10, 0), False],
+        ]
+    )
+    def test_each_device_needs_its_own_target(self, built, capability, expected):
+        self.assertEqual(self._supported(built, capability), expected)
+
+    def test_the_table_covers_every_kpacked_target(self):
+        self.assertEqual(set(disco_optimized._KPACKED_BUILT_FOR), set(self._TARGETS.values()))
+
+    def test_any_target_builds_the_kpacked_buffers(self):
+        # construction cannot know the device yet, so any built target is enough there
+        build_available = disco_optimized._kpacked_build_available.__wrapped__
+        for built in ((), ("9.0a",), ("10.0a",), ("10.3a",), ("9.0a", "10.0a", "10.3a")):
+            with self.subTest(built=built), mock.patch.dict(disco_optimized._KPACKED_BUILT_FOR, self._flags(built)):
+                self.assertEqual(build_available(), bool(built))
 
 
 def _arc_state(conv):
@@ -1256,7 +1320,7 @@ class TestKpackedPath(unittest.TestCase):
         out = conv(inp)
         self.assertEqual(out.dtype, torch.bfloat16)
 
-    @unittest.skipUnless(_kpacked_built_for_sm100(), "kpacked forward on Blackwell requires SM_100a (GB200/B200) and an sm_100a build")
+    @unittest.skipUnless(_kpacked_built_for_sm100(), "kpacked forward on Blackwell requires a 10.0 or 10.3 device and the matching 10.0a / 10.3a build")
     def test_kpacked_forward_activates_on_sm100(self):
         """tcgen05 kpacked path is chosen for bf16/fp16 on Blackwell."""
         conv = self._make_conv(1, 8, (16, 32))
@@ -1266,7 +1330,7 @@ class TestKpackedPath(unittest.TestCase):
         out = conv(inp)
         self.assertEqual(out.dtype, torch.bfloat16)
 
-    @unittest.skipUnless(_is_kpacked_supported(), "kpacked forward requires SM_90a or SM_100a")
+    @unittest.skipUnless(_is_kpacked_supported(), "kpacked forward requires SM_90a, SM_100a or SM_103a")
     def test_kpacked_matches_optimized(self, verbose=True):
         """The kpacked tensor-core forward matches the arc kernels numerically."""
         set_seed(123)
@@ -1293,7 +1357,7 @@ class TestKpackedPath(unittest.TestCase):
         self.assertTrue(compare_tensors("inp grad", inp.grad.float(), inp_ref.grad.float(), atol=5e-2, rtol=5e-2, verbose=verbose))
         self.assertTrue(compare_tensors("weight grad", conv_kpacked.weight.grad.float(), conv_opt.weight.grad.float(), atol=5e-2, rtol=5e-2, verbose=verbose))
 
-    @unittest.skipUnless(_is_kpacked_supported(), "kpacked forward requires SM_90a or SM_100a")
+    @unittest.skipUnless(_is_kpacked_supported(), "kpacked forward requires SM_90a, SM_100a or SM_103a")
     def test_kpacked_contraction_double_backward(self):
         """The kpacked contraction's backward is the transpose op, so it is differentiable: its derivative is the arc contraction."""
         from torch_harmonics.disco.optimized.disco_optimized import _disco_s2_contraction_kpacked, _disco_s2_contraction_regular_optimized
@@ -1315,7 +1379,7 @@ class TestKpackedPath(unittest.TestCase):
         ref = _disco_s2_contraction_regular_optimized(u, *arcs, conv.kernel_size, conv.nlat_out, conv.nlon_out)
         self.assertTrue(compare_tensors("double backward", ggrad.float(), ref.float(), atol=1e-2, rtol=1e-2))
 
-    @unittest.skipUnless(_is_kpacked_supported(), "kpacked forward requires SM_90a or SM_100a")
+    @unittest.skipUnless(_is_kpacked_supported(), "kpacked forward requires SM_90a, SM_100a or SM_103a")
     def test_kpacked_fused_matches_unfused(self):
         """fused=True kpacked path gives the same result as fused=False."""
         set_seed(42)
@@ -1336,7 +1400,7 @@ class TestKpackedPath(unittest.TestCase):
         out_f.backward(grad.clone())
         self.assertTrue(compare_tensors("inp grad", inp.grad, inp2.grad, atol=1e-2, rtol=1e-2))
 
-    @unittest.skipUnless(_is_kpacked_supported(), "kpacked forward requires SM_90a or SM_100a")
+    @unittest.skipUnless(_is_kpacked_supported(), "kpacked forward requires SM_90a, SM_100a or SM_103a")
     def test_kpacked_bwd_bc_tile_boundaries(self):
         """BC_TILE selection: exercises BC_TILE=1 (BC=3), BC_TILE=4 (BC=5), BC_TILE=8 (BC=16).
 
@@ -1407,7 +1471,7 @@ class TestKpackedPath(unittest.TestCase):
         out_f.backward(grad.clone())
         self.assertTrue(compare_tensors("inp grad", inp.grad, inp2.grad, atol=1e-3, rtol=1e-3))
 
-    @unittest.skipUnless(_is_kpacked_supported(), "kpacked forward requires SM_90a or SM_100a")
+    @unittest.skipUnless(_is_kpacked_supported(), "kpacked forward requires SM_90a, SM_100a or SM_103a")
     def test_kpacked_opcheck(self):
         """forward_kpacked op satisfies the PT2 opcheck contract."""
         conv = self._make_conv(1, 8, (16, 32))
@@ -1450,7 +1514,6 @@ class TestDiscreteContinuousConvRaggedS2(unittest.TestCase):
     """DISCO on ragged grids: the per-point psi, the ragged backends and their agreement."""
 
     def setUp(self):
-        disable_tf32()
         set_seed(333)
 
     def _make(
@@ -1591,9 +1654,11 @@ class TestDiscreteContinuousConvRaggedS2(unittest.TestCase):
         out_opt.backward(grad_output)
         inp_grad_opt = inp.grad.clone()
 
-        self.assertTrue(compare_tensors("output", out_naive, out_opt, atol=atol, rtol=rtol, verbose=verbose))
-        self.assertTrue(compare_tensors("input grad", inp_grad_naive, inp_grad_opt, atol=atol, rtol=rtol, verbose=verbose))
-        self.assertTrue(compare_tensors("weight grad", conv_naive.weight.grad, conv_opt.weight.grad, atol=atol, rtol=rtol, verbose=verbose))
+        # the weight gradient is a sum over batch and points, see param_grad_ulps
+        pg_ulps = param_grad_ulps(inp.shape[0] * max(conv_opt.grid_in.npoints, conv_opt.grid_out.npoints), dtype)
+        self.assertTrue(compare_tensors("output", out_opt, out_naive, atol=atol, rtol=rtol, verbose=verbose))
+        self.assertTrue(compare_tensors("input grad", inp_grad_opt, inp_grad_naive, atol=atol, rtol=rtol, verbose=verbose))
+        self.assertTrue(compare_tensors("weight grad", conv_opt.weight.grad, conv_naive.weight.grad, atol=atol, rtol=rtol, verbose=verbose, ulps=pg_ulps, eps_dtype=dtype))
 
     @parameterized.expand(
         [
@@ -1797,5 +1862,39 @@ class TestDiscreteContinuousConvRaggedS2(unittest.TestCase):
         self.assertTrue(torch.equal(vals_ref, vals_arc))
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestDiscreteContinuousConvWithoutFloat64Device(unittest.TestCase):
+    """The torch reference backends on a device without float64 (MPS), where psi must be float32."""
+
+    _GRIDS = {"regular": (("equiangular", 9, 16), ("equiangular", 5, 8)), "ragged": (("healpix", 4), ("healpix", 4))}
+
+    def setUp(self):
+        set_seed(333)
+
+    def _conv(self, transpose, family):
+        grid_in, grid_out = self._GRIDS[family]
+        Conv = DiscreteContinuousConvTransposeS2 if transpose else DiscreteContinuousConvS2
+        if transpose:
+            grid_in, grid_out = grid_out, grid_in
+        return Conv(_grid(grid_in), _grid(grid_out), 3, 2, (3, 4), basis_type="piecewise linear", optimized_kernel=False)
+
+    @parameterized.expand([[False, "regular"], [True, "regular"], [False, "ragged"], [True, "ragged"]])
+    def test_reference_psi_follows_layer_dtype(self, transpose, family):
+        """The reference psi is float64 for a float64 layer and float32 again after .float()."""
+        conv = self._conv(transpose, family).double()
+        self.assertTrue(conv.backend.name.endswith("-reference"))
+        self.assertEqual(conv.psi.dtype, torch.float64)
+        conv = conv.float()
+        self.assertTrue(conv.backend.name.endswith("-reference"))
+        self.assertEqual(conv.psi.dtype, torch.float32)
+
+    @parameterized.expand([[False, "regular"], [True, "regular"], [False, "ragged"], [True, "ragged"]])
+    @unittest.skipUnless(torch.backends.mps.is_available(), "needs an MPS device")
+    def test_conv_moves_to_mps(self, transpose, family):
+        """A layer moved to MPS selects the reference and agrees with its CPU result."""
+        conv = self._conv(transpose, family)
+        inp = _field(2, 3, conv.grid_in, torch.float32, "cpu")
+        expected = conv(inp)
+        conv = conv.to("mps")
+        self.assertTrue(conv.backend.name.endswith("-reference"))
+        out = conv(inp.to("mps")).cpu()
+        self.assertTrue(compare_tensors("mps output", out, expected, atol=1e-5, rtol=1e-4))

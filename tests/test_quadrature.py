@@ -31,11 +31,10 @@
 
 import math
 import unittest
-from unittest import mock
 
 import torch
 from parameterized import parameterized, parameterized_class
-from testutils import compare_tensors, set_seed
+from testutils import compare_tensors, float64_buffers, move_as_to_mps, range_atol, set_seed
 
 import torch_harmonics as th
 from torch_harmonics.quadrature import precompute_latitudes, precompute_longitudes, trapezoidal_weights
@@ -46,23 +45,32 @@ if torch.cuda.is_available():
     _devices.append((torch.device("cuda"),))
 
 
+# Error budget in ULPs of the integral of |f| (see testutils.range_atol): a float32
+# quadrature sums the whole grid, so its rounding error scales with the summed terms. Where
+# the integrand has one sign (the constant fields) that is the reference itself.
+# Measured: 1.3 ULPs of the reference for constant fields, 0.05 of int |f| for random ones.
+_QUAD_ULPS = 8
+
+
 @parameterized_class(("device"), _devices)
 class TestQuadrature(unittest.TestCase):
     """Serial QuadratureS2 integration tests."""
 
     @parameterized.expand(
         [
-            [64, 128, 2, 3, "equiangular", False, 1e-6, 1e-6],
-            [64, 128, 2, 3, "equiangular", True, 1e-6, 1e-6],
-            [65, 128, 1, 1, "legendre-gauss", False, 1e-6, 1e-6],
-            [65, 128, 1, 1, "legendre-gauss", True, 1e-6, 1e-6],
-            [65, 128, 2, 2, "lobatto", False, 1e-6, 1e-6],
-            [65, 128, 2, 2, "lobatto", True, 1e-6, 1e-6],
-            [64, 128, 2, 3, "trapezoidal", False, 1e-6, 1e-6],
-            [64, 128, 2, 3, "trapezoidal", True, 1e-6, 1e-6],
+            [64, 128, 2, 3, "equiangular", False],
+            [64, 128, 2, 3, "equiangular", True],
+            [64, 128, 2, 3, "fejer1", False],
+            [65, 128, 2, 3, "fejer1", True],
+            [65, 128, 1, 1, "legendre-gauss", False],
+            [65, 128, 1, 1, "legendre-gauss", True],
+            [65, 128, 2, 2, "lobatto", False],
+            [65, 128, 2, 2, "lobatto", True],
+            [64, 128, 2, 3, "trapezoidal", False],
+            [64, 128, 2, 3, "trapezoidal", True],
         ]
     )
-    def test_constant_integral(self, nlat, nlon, batch_size, num_chan, grid, normalize, atol, rtol, verbose=False):
+    def test_constant_integral(self, nlat, nlon, batch_size, num_chan, grid, normalize, verbose=False):
 
         set_seed(333)
 
@@ -74,80 +82,13 @@ class TestQuadrature(unittest.TestCase):
         expected_value = 1.0 if normalize else 4.0 * torch.pi
         expected = torch.full((batch_size, num_chan), expected_value, dtype=torch.float32, device=self.device)
 
-        self.assertTrue(compare_tensors("output", out, expected, atol=atol, rtol=rtol, verbose=verbose))
+        self.assertTrue(compare_tensors("output", out, expected, atol=0.0, rtol=0.0, ulps=_QUAD_ULPS, verbose=verbose))
 
     @parameterized.expand(
         [
             # nlat, nlon, grid
             [64, 128, "equiangular"],
-            [65, 128, "legendre-gauss"],
-            [65, 128, "lobatto"],
-            [64, 128, "trapezoidal"],
-        ]
-    )
-    def test_odd_latitude_integral(self, nlat, nlon, grid, verbose=False):
-        """cos(theta) is odd in cos-theta, so its integral over S^2 must be zero.
-
-        Analytically: 2*pi * integral_{-1}^{1} t dt = 0.
-        This exercises the sign and symmetry of the latitude quadrature weights.
-        """
-        set_seed(333)
-
-        quad = th.QuadratureS2(th.as_grid(grid, nlat=nlat, nlon=nlon), normalize=False).to(self.device)
-
-        # cos(theta) on the grid: precompute_latitudes returns colatitude angles
-        # theta in [0, pi], so cos(theta) in [-1, 1]
-        lats, _ = precompute_latitudes(nlat, grid=grid)
-        cos_theta = torch.cos(lats).to(torch.float32).to(self.device)  # shape [nlat]
-        # broadcast over batch=1, channel=1, and all longitudes
-        f = cos_theta.view(1, 1, nlat, 1).expand(1, 1, nlat, nlon)
-
-        out = quad(f)
-        expected = torch.zeros(1, 1, device=self.device)
-
-        self.assertTrue(compare_tensors("odd latitude integral", out, expected, atol=1e-5, rtol=0.0, verbose=verbose))
-
-    @parameterized.expand(
-        [
-            # nlat, nlon, grid, atol, rtol
-            [64, 128, "equiangular", 1e-5, 1e-5],
-            [65, 128, "legendre-gauss", 1e-5, 1e-5],
-            [65, 128, "lobatto", 1e-5, 1e-5],
-            [64, 128, "trapezoidal", 1e-2, 1e-2],
-        ]
-    )
-    def test_polynomial_latitude_integral(self, nlat, nlon, grid, atol, rtol, verbose=False):
-        """cos^2(theta) integrates to 4*pi/3 (unnormalized) or 1/3 (normalized).
-
-        Analytically: 2*pi * integral_{-1}^{1} t^2 dt = 2*pi * 2/3 = 4*pi/3.
-        Gauss-type quadrature rules integrate quadratic polynomials in cos-theta
-        exactly; the trapezoidal rule (trapezoidal) has O(h^2) error.
-        """
-        set_seed(333)
-
-        lats, _ = precompute_latitudes(nlat, grid=grid)
-        cos2_theta = torch.cos(lats).pow(2).to(dtype=torch.float32, device=self.device)  # shape [nlat]
-        f = cos2_theta.view(1, 1, nlat, 1).expand(1, 1, nlat, nlon)
-
-        for normalize, expected_val in [(False, 4.0 * math.pi / 3.0), (True, 1.0 / 3.0)]:
-            quad = th.QuadratureS2(th.as_grid(grid, nlat=nlat, nlon=nlon), normalize=normalize).to(self.device)
-            out = quad(f)
-            expected = torch.full((1, 1), expected_val, device=self.device)
-            self.assertTrue(
-                compare_tensors(
-                    f"cos^2 integral (normalize={normalize})",
-                    out,
-                    expected,
-                    atol=atol,
-                    rtol=rtol,
-                    verbose=verbose,
-                )
-            )
-
-    @parameterized.expand(
-        [
-            # nlat, nlon, grid
-            [64, 128, "equiangular"],
+            [64, 128, "fejer1"],
             [65, 128, "legendre-gauss"],
             [65, 128, "lobatto"],
             [64, 128, "trapezoidal"],
@@ -171,12 +112,15 @@ class TestQuadrature(unittest.TestCase):
         out = quad(f)
         expected = torch.zeros(1, 1, device=self.device)
 
-        self.assertTrue(compare_tensors("zero longitude mean", out, expected, atol=1e-5, rtol=0.0, verbose=verbose))
+        # the reference is zero, so the floor comes from the size of the summed terms
+        atol = range_atol(quad(f.abs()), 0.0, _QUAD_ULPS)
+        self.assertTrue(compare_tensors("zero longitude mean", out, expected, atol=atol, rtol=0.0, verbose=verbose))
 
     @parameterized.expand(
         [
             # nlat, nlon, batch, channels, grid
             [64, 128, 2, 3, "equiangular"],
+            [64, 128, 2, 3, "fejer1"],
             [65, 128, 1, 1, "legendre-gauss"],
         ]
     )
@@ -200,8 +144,8 @@ class TestQuadrature(unittest.TestCase):
                 "normalization consistency",
                 out_norm,
                 out_raw / (4.0 * math.pi),
-                atol=1e-6,
-                rtol=1e-5,
+                atol=range_atol(quad_norm(data.abs()), 0.0, _QUAD_ULPS),
+                rtol=0.0,
                 verbose=verbose,
             )
         )
@@ -259,6 +203,7 @@ class TestQuadratureLeadingDimensions(unittest.TestCase):
     @parameterized.expand(
         [
             ["equiangular", False],
+            ["fejer1", True],
             ["legendre-gauss", True],
             ["healpix", False],
             ["healpix", True],
@@ -274,7 +219,7 @@ class TestQuadratureLeadingDimensions(unittest.TestCase):
                 field = amplitudes.reshape(*leading, *([1] * len(grid.shape))) * torch.ones(grid.shape, device=self.device)
                 out = quad(field)
                 self.assertEqual(out.shape, torch.Size(leading))
-                self.assertTrue(compare_tensors(f"integral {leading}", out, amplitudes * expected_integral, atol=1e-5, rtol=1e-5))
+                self.assertTrue(compare_tensors(f"integral {leading}", out, amplitudes * expected_integral, atol=0.0, rtol=0.0, ulps=_QUAD_ULPS))
 
 
 @parameterized_class(("device",), _devices)
@@ -302,10 +247,6 @@ def _float64_layers():
     return [
         ["quadrature", lambda: th.QuadratureS2(grid), (2, *grid.shape), torch.float32],
         ["quadrature_volume", lambda: th.QuadratureVolume(product), (2, *product.shape), torch.float32],
-        ["sht", lambda: th.RealSHT(grid), (2, *grid.shape), torch.float32],
-        ["inverse_sht", lambda: th.InverseRealSHT(grid, lmax=5, mmax=5), (2, 5, 5), torch.complex64],
-        ["vector_sht", lambda: th.RealVectorSHT(grid), (2, 2, *grid.shape), torch.float32],
-        ["inverse_vector_sht", lambda: th.InverseRealVectorSHT(grid, lmax=5, mmax=5), (2, 2, 5, 5), torch.complex64],
     ]
 
 
@@ -315,30 +256,26 @@ class TestFloat64BuffersOnDevicesWithout(unittest.TestCase):
     @parameterized.expand(_float64_layers())
     def test_downcast_on_the_move(self, name, build, shape, dtype):
         layer = build()
-        self.assertTrue(any(b.dtype == torch.float64 for b in layer.buffers()), msg=f"{name} keeps no float64 weights")
+        self.assertTrue(float64_buffers(layer), msg=f"{name} keeps no float64 weights")
         x = torch.randn(shape, dtype=dtype)
         expected = layer(x)
 
-        # pretend the CPU is such a device, so the move takes the MPS path here
-        with mock.patch("torch_harmonics.utils._NO_FLOAT64_DEVICE_TYPES", frozenset({"cpu"})):
-            layer = layer.to("cpu")
-        self.assertFalse(any(b.dtype == torch.float64 for b in layer.buffers()), msg=f"{name} kept a float64 buffer")
+        layer = move_as_to_mps(layer)
+        self.assertFalse(float64_buffers(layer), msg=f"{name} kept a float64 buffer")
         # the inputs are float32, which the weights were cast to at use anyway
-        self.assertTrue(torch.equal(layer(x), expected))
+        self.assertTrue(compare_tensors("downcast weights", layer(x), expected, atol=0, rtol=0))
 
     @parameterized.expand(_float64_layers())
     def test_other_moves_keep_float64(self, name, build, shape, dtype):
         layer = build().to("cpu")
-        self.assertTrue(any(b.dtype == torch.float64 for b in layer.buffers()), msg=f"{name} lost its float64 weights")
+        self.assertTrue(float64_buffers(layer), msg=f"{name} lost its float64 weights")
 
     def test_recast_reaches_layers_inside_a_model(self):
         """A model's move reaches its layers through _apply, not through their to(), which is why the recast hooks _apply."""
         grid = th.as_grid("legendre-gauss", nlat=8, nlon=16)
         model = torch.nn.Sequential(th.SpectralConvS2(grid, grid, 4, 4, bias=True), torch.nn.Sequential(th.QuadratureS2(grid)))
-        self.assertTrue(any(b.dtype == torch.float64 for b in model.buffers()))
-        with mock.patch("torch_harmonics.utils._NO_FLOAT64_DEVICE_TYPES", frozenset({"cpu"})):
-            model = model.to("cpu")
-        self.assertFalse(any(b.dtype == torch.float64 for b in model.buffers()))
+        self.assertTrue(float64_buffers(model))
+        self.assertFalse(float64_buffers(move_as_to_mps(model)))
 
     def test_probe_ignores_a_float64_default(self):
         """The destination probe is float32 whatever the default dtype, or it would fail on MPS itself."""
@@ -383,6 +320,7 @@ class TestQuadratureWeightPrecision(unittest.TestCase):
     @parameterized.expand(
         [
             ["equiangular"],
+            ["fejer1"],
             ["legendre-gauss"],
             ["lobatto"],
             ["trapezoidal"],
@@ -424,5 +362,81 @@ class TestQuadratureWeightPrecision(unittest.TestCase):
         self.assertTrue(compare_tensors(f"trapezoidal weights (periodic={periodic})", w, expected, atol=1e-15, rtol=1e-15, verbose=verbose))
 
 
-if __name__ == "__main__":
-    unittest.main()
+def _legendre_moments(x: torch.Tensor, w: torch.Tensor, degree: int) -> torch.Tensor:
+    """sum_k w_k P_n(x_k) for n = 0..degree, by the three-term recurrence.
+
+    Legendre polynomials rather than monomials: x**n at n ~ 130 is so ill-conditioned
+    that an exact rule and an inexact one are indistinguishable in float64.
+    """
+    p_prev, p = torch.ones_like(x), x
+    moments = [(w * p_prev).sum(), (w * p).sum()]
+    for n in range(1, degree):
+        p_prev, p = p, ((2 * n + 1) * x * p - n * p_prev) / (n + 1)
+        moments.append((w * p).sum())
+    return torch.stack(moments[: degree + 1])
+
+
+# highest polynomial degree in cos(theta) each latitude rule integrates exactly, for n nodes
+_EXACT_POLYNOMIAL_DEGREE = {
+    "legendre-gauss": lambda n: 2 * n - 1,
+    "lobatto": lambda n: 2 * n - 3,
+    # Clenshaw--Curtis and Fejer-1 gain one degree at odd n from the symmetry of their nodes
+    "equiangular": lambda n: n if n % 2 else n - 1,
+    "fejer1": lambda n: n if n % 2 else n - 1,
+    "trapezoidal": lambda n: 1,
+}
+
+_EXACTNESS_CASES = [[grid, nlat] for grid in _EXACT_POLYNOMIAL_DEGREE for nlat in (2, 3, 8, 9, 64, 65)]
+
+
+class TestQuadratureExactness(unittest.TestCase):
+    """
+    Each latitude rule integrates polynomials in cos(theta) exactly up to its documented
+    degree, and no further. The SHT defaults rest on these degrees: an associated Legendre
+    product P_l^m P_l'^m is a polynomial of degree l + l', so the analysis is exact for
+    every degree below the grid's ``max_exact_degree`` exactly when 2 (max_exact_degree - 1)
+    does not exceed the rule's degree.
+    """
+
+    @parameterized.expand(_EXACTNESS_CASES)
+    def test_exact_through_documented_degree(self, grid, nlat, verbose=False):
+        colats, weights = precompute_latitudes(nlat, grid=grid)
+        degree = _EXACT_POLYNOMIAL_DEGREE[grid](nlat)
+        moments = _legendre_moments(colats.cos(), weights, degree)
+        # the integral of P_n over [-1, 1] is 2 for n = 0 and 0 otherwise
+        expected = torch.zeros_like(moments)
+        expected[0] = 2.0
+        self.assertTrue(compare_tensors(f"{grid} moments through degree {degree}", moments, expected, atol=1e-13, rtol=0.0, verbose=verbose))
+
+    @parameterized.expand(_EXACTNESS_CASES)
+    def test_not_exact_beyond_documented_degree(self, grid, nlat):
+        """The documented degree is sharp: the first even degree above it is integrated wrongly.
+
+        Odd degrees integrate to zero on any pole-symmetric rule, so they cannot show it.
+        """
+        colats, weights = precompute_latitudes(nlat, grid=grid)
+        degree = _EXACT_POLYNOMIAL_DEGREE[grid](nlat)
+        first_even = degree + 1 if degree % 2 else degree + 2
+        error = _legendre_moments(colats.cos(), weights, first_even)[-1].abs().item()
+        self.assertGreater(error, 1e-9, f"{grid} at nlat={nlat} is exact beyond degree {degree}")
+
+    @parameterized.expand(_EXACTNESS_CASES)
+    def test_weights_are_positive_and_sum_to_two(self, grid, nlat, verbose=False):
+        _, weights = precompute_latitudes(nlat, grid=grid)
+        self.assertGreater(weights.min().item(), 0.0)
+        total = weights.sum()
+        self.assertTrue(compare_tensors(f"{grid} weight sum", total, torch.full_like(total, 2.0), atol=1e-14, rtol=0.0, verbose=verbose))
+
+    @parameterized.expand(_EXACTNESS_CASES)
+    def test_default_sht_band_follows_from_exactness(self, grid, nlat):
+        """On a spectrally accurate grid, max_exact_degree is the largest L with 2 (L - 1) <= degree.
+
+        The trapezoidal grid keeps the equiangular default although its rule cannot support
+        it from nlat = 3 on, which is why it is flagged as not spectrally accurate.
+        """
+        descriptor = th.as_grid(grid, nlat=nlat, nlon=2 * nlat)
+        supported = _EXACT_POLYNOMIAL_DEGREE[grid](nlat) // 2 + 1
+        if descriptor.is_spectrally_accurate:
+            self.assertEqual(descriptor.max_exact_degree, supported)
+        elif nlat > 2:
+            self.assertGreater(descriptor.max_exact_degree, supported)

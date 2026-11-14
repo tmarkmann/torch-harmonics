@@ -147,8 +147,10 @@ pip install -e . --no-build-isolation
 
 Custom CUDA extensions require compute capability **≥ 8.0**. The tensor-core DISCO forward
 kernels are only compiled when `TORCH_CUDA_ARCH_LIST` names the arch-specific targets: `9.0a`
-for Hopper, `10.0a` / `10.3a` for datacenter Blackwell. With plain `9.0` or `10.0` they compile
-to stubs and those GPUs fall back to the generic path.
+for Hopper, `10.0a` for GB200/B200, `10.3a` for GB300/B300. Each target enables only its own
+device: the kpacked path is selected on a GPU only if its exact `X.Ya` target was built, and
+otherwise that GPU falls back to the generic path. Plain `9.0` or `10.0` targets compile the
+tensor-core kernels to stubs and never enable them.
 
 ### Build environment variables
 
@@ -247,7 +249,7 @@ runs them in a separate job; see [Running distributed tests](#running-distribute
 | Change type | Suggested tests |
 |-------------|-----------------|
 | Grids / HEALPix | `tests/test_grid_assumptions.py`, `tests/test_neighborhood.py`, `tests/test_cache.py` |
-| SHT / quadrature / resampling | `tests/test_sht.py`, `tests/test_truncation.py`, `tests/test_quadrature.py`, `tests/test_resample.py`, `tests/test_spectral_convolution.py` |
+| SHT / quadrature / resampling | `tests/test_sht.py`, `tests/test_legendre.py`, `tests/test_latitude_folding.py`, `tests/test_truncation.py`, `tests/test_quadrature.py`, `tests/test_resample.py`, `tests/test_spectral_convolution.py` |
 | DISCO convolution | `tests/test_convolution.py`, `tests/test_filter_basis.py`, `tests/test_neighborhood.py` |
 | Attention | `tests/test_attention.py`, `tests/test_attention_layout.py`, `tests/test_neighborhood.py` |
 | Example models, losses, metrics | `tests/test_example_models.py`, `tests/test_losses.py`, `tests/test_metrics.py` |
@@ -270,10 +272,12 @@ serial ones are correct. CI runs every `tests/test_distributed_*.py` file on CPU
 backend, on process grids from 1x1 to 4x2 (up to 8 ranks). CUDA and NCCL paths are skipped
 there, so run the tests on GPUs yourself when you change them.
 
-Each rank is a separate pytest process. Tests read `WORLD_RANK`, `GRID_H`, `GRID_W`,
-`MASTER_ADDR`, and `MASTER_PORT` from the environment; the world size is `GRID_H * GRID_W`
-(see `tests/testutils.py`). Set `WORLD_RANK` for every process: it defaults to 0, and `RANK`
-is not read in its place. To run one file on a 2x2 grid on CPU the way CI does:
+Each rank is a separate pytest process. Tests read the rank from `WORLD_RANK`, or from `RANK`
+as torchrun sets it, the grid from `GRID_H` and `GRID_W`, and `MASTER_ADDR` and `MASTER_PORT`
+from the environment; the world size is `GRID_H * GRID_W` (see `world_rank` and
+`setup_distributed_context` in `tests/testutils.py`). If `WORLD_SIZE` is set, it must equal
+`GRID_H * GRID_W`. Set the rank for every process: it defaults to 0. To run one file on a 2x2
+grid on CPU the way CI does:
 
 ```bash
 export CUDA_VISIBLE_DEVICES="" GRID_H=2 GRID_W=2 MASTER_ADDR=localhost MASTER_PORT=29501
@@ -292,6 +296,16 @@ echo "exit status: $status"
 Leaving out `CUDA_VISIBLE_DEVICES=""` runs the tests on GPUs with NCCL whenever CUDA is
 available. That needs one visible GPU per rank, since ranks are assigned to GPUs round-robin
 and NCCL does not support several ranks on one GPU.
+
+Alternatively, launch with `torchrun`, one process per grid cell:
+
+```bash
+GRID_H=2 GRID_W=2 torchrun --nproc-per-node 4 --master-addr 127.0.0.1 --master-port 29500 \
+  -m pytest tests/test_distributed_sht.py
+```
+
+Pass `--master-addr` and `--master-port` explicitly: on hosts whose hostname does not resolve,
+torchrun's default rendezvous never starts the workers.
 
 `tests/run_tests.sh -d --grid_size_lat 2 --grid_size_lon 2` launches the same through `mpirun`
 (Open MPI), but covers only the SHT, convolution, and resample suites. If you change distributed

@@ -65,6 +65,7 @@ from torch_harmonics.filter_basis import get_filter_basis
 from torch_harmonics.grid import (
     _GRID_REGISTRY,
     EquiangularGrid,
+    Fejer1Grid,
     GridS2,
     GridShardS2,
     LegendreGaussGrid,
@@ -85,7 +86,7 @@ from torch_harmonics.partition import compute_split_shapes
 from torch_harmonics.quadrature import compute_latitude_spacing, compute_theta_cutoff, precompute_latitudes, precompute_longitudes
 from torch_harmonics.truncation import truncate_support
 
-_ALL_GRIDS = ["equiangular", "legendre-gauss", "lobatto", "trapezoidal"]
+_ALL_GRIDS = ["equiangular", "fejer1", "legendre-gauss", "lobatto", "trapezoidal"]
 
 # grids on which the superseded pi / (nlat - 1) heuristic was too narrow near the poles
 _IRREGULAR_THETA_GRIDS = ["lobatto", "trapezoidal"]
@@ -97,6 +98,7 @@ _POLE_INCLUSIVE_GRIDS = ["equiangular", "lobatto", "trapezoidal"]
 # the class a caller would instantiate directly, against the name as_grid resolves
 _DIRECT_CLASSES = {
     "equiangular": EquiangularGrid,
+    "fejer1": Fejer1Grid,
     "legendre-gauss": LegendreGaussGrid,
     "lobatto": LobattoGrid,
     "trapezoidal": TrapezoidalGrid,
@@ -273,12 +275,12 @@ class TestThetaCutoffContract(unittest.TestCase):
         with self.assertWarns(UserWarning):
             compute_theta_cutoff(nlat, grid=grid)
 
-    @parameterized.expand([[nlat] for nlat in _NLATS])
-    def test_unchanged_default_does_not_warn(self, nlat):
-        """The equiangular default is unchanged, so warning there would be noise."""
+    @parameterized.expand([[nlat, grid] for nlat in _NLATS for grid in ("equiangular", "fejer1")])
+    def test_unchanged_or_new_default_does_not_warn(self, nlat, grid):
+        """Existing equiangular and new Fejer-1 grids have no moved cutoff to announce."""
         with warnings.catch_warnings():
             warnings.simplefilter("error", UserWarning)
-            compute_theta_cutoff(nlat, grid="equiangular")
+            compute_theta_cutoff(nlat, grid=grid)
 
 
 class TestThetaCutoffPsiRegression(unittest.TestCase):
@@ -327,6 +329,13 @@ class TestGridNodeDistribution(unittest.TestCase):
         lats, _ = precompute_latitudes(nlat, grid="equiangular")
         dlat = lats[1:] - lats[:-1]
         self.assertTrue(compare_tensors(f"equiangular dtheta (nlat={nlat})", dlat, dlat.mean().expand_as(dlat), atol=1e-12, rtol=0.0, verbose=verbose))
+
+    @parameterized.expand([[nlat] for nlat in _NLATS])
+    def test_fejer1_nodes_are_midpoints(self, nlat, verbose=False):
+        """Fejer-1 nodes sit at the midpoints of nlat equal intervals in theta, so neither pole is a node."""
+        lats, _ = precompute_latitudes(nlat, grid="fejer1")
+        expected = math.pi * (torch.arange(nlat, dtype=torch.float64) + 0.5) / nlat
+        self.assertTrue(compare_tensors(f"fejer1 nodes (nlat={nlat})", lats, expected, atol=1e-14, rtol=0.0, verbose=verbose))
 
     @parameterized.expand([[nlat] for nlat in _NLATS])
     def test_equiangular_trapezoidal_nodes_are_equispaced_in_cos_theta(self, nlat, verbose=False):
@@ -730,9 +739,10 @@ class TestGridDescriptor(unittest.TestCase):
     @parameterized.expand([[grid] for grid in _ALL_GRIDS])
     def test_equal_descriptors_hash_equal(self, grid):
         """
-        Load-bearing: `torch_harmonics/cache.py` keys its `lru_cache` on the grid.
-        A descriptor that hashed by object identity would turn every lookup into a
-        miss, silently regressing psi and Legendre precompute.
+        Load-bearing: the shared tables of `torch_harmonics/cache.py` and the
+        `lru_cache` of the grid helpers key on the grid. A descriptor that hashed by
+        object identity would turn every lookup into a miss, silently rebuilding the
+        psi and Legendre tables for every layer instead of sharing them.
         """
         a = as_grid(grid, nlat=64, nlon=128)
         b = as_grid(grid, nlat=64, nlon=128)
@@ -1872,10 +1882,14 @@ class TestHealpixGrid(unittest.TestCase):
         self.assertFalse(g.is_spectrally_accurate)
         with self.assertRaises(NotImplementedError):
             g.max_exact_degree
-        # no max_azimuthal_order assertion: that is a RegularGridS2 concept. Every
-        # HEALPix ring has its own azimuthal bandwidth, so a single value would have
-        # to be the widest ring's, which is not what any caller of it means.
-        self.assertFalse(hasattr(type(g), "max_azimuthal_order"))
+        # Every HEALPix ring has its own azimuthal bandwidth, so max_azimuthal_order is
+        # not the widest ring's: it is the order bound of the SHT, which recovers orders
+        # above a ring's Nyquist limit from the rings jointly, up to the same 3 * nside
+        # as the degree. The SHT defaults stay at 2 * nside, where the analysis is well
+        # conditioned.
+        self.assertEqual(g.max_azimuthal_order, 3 * g.nside)
+        self.assertEqual(g.max_recoverable_degree, 3 * g.nside)
+        self.assertEqual(g.default_sht_degree, 2 * g.nside)
 
     # -- support radius ------------------------------------------------------
 
@@ -2014,17 +2028,18 @@ class TestHealpixGrid(unittest.TestCase):
 
     # -- decomposition -------------------------------------------------------
 
-    def test_it_refuses_a_product_decomposition(self):
+    def test_it_refuses_an_azimuthal_decomposition(self):
         """
-        There is no global ``nlon`` to split, so a product shard would describe ranges
-        that do not exist. Failing loudly is the point: the distributed layers assume
-        the product form in twenty-two places.
+        There is no global ``nlon`` to split, so an azimuthal shard would describe ranges
+        that do not exist; failing loudly is the point. Latitude is the one axis it splits.
         """
         g = HealpixGrid(nside=4)
-        for name, call in (("shard(polar=)", lambda: g.shard(polar=(0, 2))), ("shard()", lambda: g.shard())):
-            with self.subTest(call=name):
-                with self.assertRaises(NotImplementedError):
-                    call()
+        with self.assertRaises(NotImplementedError):
+            g.shard(azimuth=(0, 2))
+        with self.assertRaises(NotImplementedError):
+            g.shard(polar=(0, 2), azimuth=(1, 2))
+        # a trivial azimuthal factor is what a one-dimensional communicator layout passes
+        self.assertEqual(g.shard(polar=(1, 2), azimuth=(0, 1)), g.shard(polar=(1, 2)))
 
         # lat_shapes and lon_shapes are not overridden to refuse -- they are simply not
         # part of this class. They describe a product decomposition, so they live on
@@ -2034,7 +2049,99 @@ class TestHealpixGrid(unittest.TestCase):
         for name in ("lat_shapes", "lon_shapes"):
             with self.subTest(attribute=name):
                 self.assertFalse(hasattr(g, name))
+                self.assertFalse(hasattr(g.shard(), name))
 
+    @parameterized.expand([[2, 1], [2, 3], [4, 4], [8, 2], [8, 5], [8, 31], [16, 7], [64, 16]])
+    def test_shards_tile_the_flat_field_exactly(self, nside, size, verbose=False):
+        """
+        The bands are contiguous, in order, and cover every ring and pixel once, so that
+        concatenating the local pieces of a flat field gives the field back.
+        """
+        g = HealpixGrid(nside=nside)
+        shards = [g.shard(polar=(r, size)) for r in range(size)]
+        self.assertEqual(sum(s.nrings for s in shards), g.nrings)
+        self.assertEqual(sum(s.npoints for s in shards), g.npoints)
+        self.assertEqual([s.npoints for s in shards], list(shards[0].pixel_shapes))
+        self.assertEqual([s.nrings for s in shards], list(shards[0].ring_shapes))
+        ring_offset = pixel_offset = 0
+        for s in shards:
+            self.assertEqual((s.ring_offset, s.pixel_offset), (ring_offset, pixel_offset))
+            self.assertEqual(s.shape, (s.npoints,))
+            self.assertGreaterEqual(s.nrings, 1)
+            ring_offset += s.nrings
+            pixel_offset += s.npoints
+        for name, local, expected in [
+            ("colats", lambda s: s.colats, g.colats),
+            ("nlon_per_lat", lambda s: s.nlon_per_lat, g.nlon_per_lat),
+            ("quad_weights", lambda s: s.quad_weights, g.quad_weights),
+        ]:
+            self.assertTrue(compare_tensors(name, torch.cat([local(s) for s in shards]), expected, atol=0.0, rtol=0.0, verbose=verbose))
+        # a ring of a shard is the ring of the grid, counted from the end as on the grid
+        for s in shards:
+            for k in {0, s.nrings - 1, -1, -s.nrings}:
+                expected = g.lons(s.ring_offset + k % s.nrings)
+                self.assertTrue(compare_tensors("lons", s.lons(k), expected, atol=0.0, rtol=0.0, verbose=verbose))
+            # outside the shard's own rings is an error, never a neighbour's ring
+            for k in (s.nrings, -s.nrings - 1):
+                with self.assertRaises(ValueError):
+                    s.lons(k)
+        total = sum(s.quad_weights.sum().item() for s in shards)
+        self.assertAlmostEqual(total, 4.0 * math.pi, places=10)
 
-if __name__ == "__main__":
-    unittest.main()
+    @parameterized.expand([[8, 2], [8, 3], [8, 4], [8, 7], [16, 8], [64, 16], [64, 64]])
+    def test_shards_hold_equal_pixel_counts_up_to_half_a_ring(self, nside, size):
+        """
+        Each cut lands on the ring boundary nearest the ideal pixel count, which is at most
+        half the longest ring, ``2 * nside``, away; a rank has two cuts.
+        """
+        pixels = HealpixGrid(nside=nside).shard(polar=(0, size)).pixel_shapes
+        mean = 12 * nside * nside / size
+        self.assertLessEqual(max(abs(n - mean) for n in pixels), 4 * nside)
+
+    def test_the_polar_ranks_hold_more_but_shorter_rings(self):
+        """Pinned so a change to the cut rule is a deliberate one: nside 64 on 16 ranks."""
+        shard = HealpixGrid(nside=64).shard(polar=(0, 16))
+        self.assertEqual(shard.ring_shapes, (39, 16, *([12] * 11), 13, 16, 39))
+        self.assertEqual(sum(shard.ring_shapes), 255)
+        self.assertLessEqual(max(shard.pixel_shapes) / (49152 / 16), 1.04)
+
+    def test_every_rank_holds_a_ring_even_when_there_are_as_many_ranks_as_rings(self):
+        g = HealpixGrid(nside=2)  # 7 rings
+        self.assertEqual(g.shard(polar=(0, 7)).ring_shapes, (1,) * 7)
+        with self.assertRaises(ValueError):
+            g.shard(polar=(0, 8))
+
+    def test_a_shard_holds_only_its_own_weights(self):
+        """
+        The local weights are built from the local rings, not sliced out of the global ones: a
+        slice would keep the whole ``12 nside^2`` tensor alive on every rank, 1.5 GiB at nside 4096.
+        """
+        g = HealpixGrid(nside=8)
+        for r in range(4):
+            w = g.shard(polar=(r, 4)).quad_weights
+            self.assertEqual(w.untyped_storage().nbytes(), w.numel() * w.element_size())
+
+    def test_the_trivial_shard_is_the_whole_grid(self):
+        g = HealpixGrid(nside=4)
+        shard = g.shard()
+        self.assertEqual((shard.shape, shard.nrings, shard.ring_offset, shard.pixel_offset), (g.shape, g.nrings, 0, 0))
+        self.assertTrue(compare_tensors("quad_weights", shard.quad_weights, g.quad_weights, atol=0.0, rtol=0.0))
+
+    def test_a_shard_is_a_keyed_value_that_is_not_a_grid(self):
+        g = HealpixGrid(nside=4)
+        shard = g.shard(polar=(np.int64(1), np.int64(3)))
+        self.assertIs(type(shard.polar_rank), int)
+        self.assertEqual(shard, g.shard(polar=(1, 3)))
+        self.assertNotEqual(shard, g.shard(polar=(0, 3)))
+        self.assertNotEqual(shard, HealpixGrid(nside=8).shard(polar=(1, 3)))
+        self.assertEqual(hash(shard), hash(g.shard(polar=(1, 3))))
+        self.assertEqual(th.GridShardS2.from_dict(shard.to_dict()), shard)
+        self.assertEqual(shard.global_grid, g)
+        self.assertIsInstance(shard, th.GridShardS2)
+        self.assertNotIsInstance(shard, th.GridS2)
+        self.assertFalse(shard.is_global)
+        self.assertFalse(shard.is_regular)
+        for polar in ((3, 3), (-1, 3), (0, 0)):
+            with self.subTest(polar=polar):
+                with self.assertRaises(ValueError):
+                    g.shard(polar=polar)

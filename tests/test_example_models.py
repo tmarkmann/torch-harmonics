@@ -40,10 +40,10 @@ accuracy tests; the grids are as small as the layers allow.
 """
 
 import unittest
-from unittest import mock
 
 import torch
 from parameterized import parameterized
+from testutils import compare_tensors, float64_buffers, move_as_to_mps
 
 from torch_harmonics import as_grid
 from torch_harmonics.examples import ShallowWaterDataset, ShallowWaterSolver, SphereSolver
@@ -108,6 +108,62 @@ class TestExampleSolvers(unittest.TestCase):
         solver = SphereSolver(grid, dt=1e-3, lmax=8, mmax=8)
         self.assertEqual(tuple(solver.lats.shape[-1:]), (16,))
 
+    @parameterized.expand([["allen-cahn"], ["ginzburg-landau"]])
+    def test_sphere_solver_keeps_float64_buffers_and_casts_at_use(self, pde):
+        """The buffers are real float64 and cast at use, so a float32 state steps in float32 and agrees with the float64 one, rounded."""
+        solver = SphereSolver(as_grid("equiangular", nlat=16, nlon=32), dt=1e-3, lmax=8, mmax=8)
+        self.assertEqual({b.dtype for b in solver.buffers() if b.is_floating_point()}, {torch.float64})
+        self.assertFalse([name for name, b in solver.named_buffers() if b.is_complex()])
+
+        torch.manual_seed(333)
+        u64 = solver.randspec()
+        self.assertEqual(u64.dtype, torch.complex128)
+        out64 = solver.dudtspec(u64, pde)
+        out32 = solver.dudtspec(u64.to(torch.complex64), pde)
+
+        self.assertEqual(out32.dtype, torch.complex64)
+        self.assertTrue(compare_tensors("float32 derivative", out32.to(torch.complex128), out64, atol=0.0, rtol=0.0, ulps=16, eps_dtype=torch.float32))
+
+    @parameterized.expand([["allen-cahn"], ["ginzburg-landau"]])
+    def test_sphere_solver_casts_to_float32_on_the_cpu(self, pde):
+        """Cast to float32 on the CPU, the solver draws and steps in complex64 and stays close to the float64 reference."""
+        grid = as_grid("equiangular", nlat=16, nlon=32)
+        solver64 = SphereSolver(grid, dt=1e-3, lmax=8, mmax=8)
+        solver32 = SphereSolver(grid, dt=1e-3, lmax=8, mmax=8).float()
+        self.assertFalse(float64_buffers(solver32))
+        self.assertEqual(solver32.randspec().dtype, torch.complex64)
+
+        torch.manual_seed(333)
+        u64 = solver64.randspec()
+        out64 = solver64.dudtspec(u64, pde)
+        out32 = solver32.dudtspec(u64.to(torch.complex64), pde)
+
+        self.assertEqual(out32.dtype, torch.complex64)
+        self.assertTrue(torch.isfinite(out32).all())
+        self.assertTrue(compare_tensors("float32 solver derivative", out32.to(torch.complex128), out64, atol=0.0, rtol=0.0, ulps=16, eps_dtype=torch.float32))
+
+    def test_sphere_solver_moves_to_a_device_without_float64(self):
+        """Moved to a device without float64 such as MPS, every buffer is downcast to float32, and a float32 state gives the same derivative."""
+        solver = SphereSolver(as_grid("equiangular", nlat=16, nlon=32), dt=1e-3, lmax=8, mmax=8)
+        torch.manual_seed(333)
+        uspec = solver.randspec().to(torch.complex64)
+        expected = solver.dudtspec(uspec)
+
+        solver = move_as_to_mps(solver)
+        self.assertFalse(float64_buffers(solver))
+        self.assertEqual(solver.randspec().dtype, torch.complex64)
+        torch.testing.assert_close(solver.dudtspec(uspec), expected)
+
+    @unittest.skipUnless(torch.backends.mps.is_available(), "needs an MPS device")
+    def test_sphere_solver_runs_on_mps(self):
+        """The solver moves to MPS and its derivative agrees with the CPU one."""
+        solver = SphereSolver(as_grid("equiangular", nlat=16, nlon=32), dt=1e-3, lmax=8, mmax=8)
+        torch.manual_seed(333)
+        uspec = solver.randspec().to(torch.complex64)
+        expected = solver.dudtspec(uspec)
+        out = solver.to("mps").dudtspec(uspec.to("mps")).cpu()
+        torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-5)
+
     def test_pde_dataset_generates_samples_on_its_grid(self):
         grid = as_grid("equiangular", nlat=16, nlon=32)
         dataset = ShallowWaterDataset(dt=60.0, nsteps=1, grid=grid, num_examples=1, normalize=False)
@@ -115,19 +171,58 @@ class TestExampleSolvers(unittest.TestCase):
         self.assertEqual(tuple(inp.shape[-2:]), grid.shape)
         self.assertEqual(tuple(tar.shape[-2:]), grid.shape)
 
-    def test_pde_dataset_casts_its_solver_before_moving_it(self):
-        """The solver holds no float64 state when it is moved, so the dataset can be built on a device without float64 such as MPS."""
-        moved_with = []
-        original = ShallowWaterSolver.to
+    @parameterized.expand([["random"], ["galewsky"]])
+    def test_shallow_water_initial_conditions_come_in_the_requested_dtype(self, ictype):
+        """
+        An initial condition comes in the dtype asked for, by default the default dtype,
+        whatever the precision of the solver's buffers; the same draw in float32 is the
+        float64 one, rounded.
+        """
+        solver = ShallowWaterSolver(as_grid("equiangular", nlat=16, nlon=32), dt=60.0, lmax=8, mmax=8)
 
-        def to(solver, *args, **kwargs):
-            moved_with.append([name for name, b in solver.named_buffers() if b.dtype in (torch.float64, torch.complex128)])
-            return original(solver, *args, **kwargs)
+        def generate(**kwargs):
+            torch.manual_seed(333)
+            return solver.random_initial_condition(mach=0.1, **kwargs) if ictype == "random" else solver.galewsky_initial_condition(**kwargs)
 
-        with mock.patch.object(ShallowWaterSolver, "to", to):
-            ShallowWaterDataset(dt=60.0, nsteps=1, grid=as_grid("equiangular", nlat=16, nlon=32), num_examples=1, normalize=False)
-        self.assertEqual(moved_with, [[]])
+        self.assertEqual(generate().dtype, solver._complex_dtype(torch.get_default_dtype()))
+        u64 = generate(dtype=torch.float64)
+        u32 = generate(dtype=torch.float32)
+        self.assertEqual((u64.dtype, u32.dtype), (torch.complex128, torch.complex64))
+        self.assertTrue(torch.equal(u32, u64.to(torch.complex64)))
 
+    def test_shallow_water_solver_steps_in_the_precision_of_the_state(self):
+        """The buffers stay float64 and are cast at use, so a float32 state steps in float32 and agrees with a float64 step, rounded."""
+        solver = ShallowWaterSolver(as_grid("equiangular", nlat=16, nlon=32), dt=60.0, lmax=8, mmax=8)
+        self.assertEqual({b.dtype for b in solver.buffers() if b.is_floating_point()}, {torch.float64})
 
-if __name__ == "__main__":
-    unittest.main()
+        torch.manual_seed(333)
+        u64 = solver.random_initial_condition(mach=0.1, dtype=torch.float64)
+        out32 = solver.timestep(u64.to(torch.complex64), 2)
+        out64 = solver.timestep(u64, 2)
+
+        self.assertEqual(out32.dtype, torch.complex64)
+        # within float32 rounding of the largest spectral coefficient (measured: 0.3 ULPs)
+        self.assertTrue(compare_tensors("float32 step", out32.to(torch.complex128), out64, atol=0.0, rtol=0.0, ulps=16, eps_dtype=torch.float32))
+
+    def test_shallow_water_dataset_keeps_float64_solver_buffers(self):
+        """The dataset generates float32 samples by casting at use, not by casting its solver."""
+        grid = as_grid("equiangular", nlat=16, nlon=32)
+        dataset = ShallowWaterDataset(dt=60.0, nsteps=1, grid=grid, num_examples=1, normalize=False)
+        self.assertEqual({b.dtype for b in dataset.solver.buffers() if b.is_floating_point()}, {torch.float64})
+        inp, tar = dataset[0]
+        self.assertEqual((inp.dtype, tar.dtype), (torch.float32, torch.float32))
+
+    def test_shallow_water_solver_moves_to_a_device_without_float64(self):
+        """
+        Moved to a device without float64 such as MPS, every buffer of the solver and its
+        SHTs is downcast to float32, and a float32 step gives the same result.
+        """
+        solver = ShallowWaterSolver(as_grid("equiangular", nlat=16, nlon=32), dt=60.0, lmax=8, mmax=8)
+        torch.manual_seed(333)
+        uspec = solver.random_initial_condition(mach=0.1, dtype=torch.float32)
+        expected = solver.timestep(uspec, 2)
+
+        solver = move_as_to_mps(solver)
+        self.assertFalse(float64_buffers(solver))
+        # the buffers were cast to float32 at use before the move, so the step agrees
+        torch.testing.assert_close(solver.timestep(uspec, 2), expected)

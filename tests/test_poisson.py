@@ -31,11 +31,10 @@
 
 import math
 import unittest
-from unittest import mock
 
 import torch
 from parameterized import parameterized, parameterized_class
-from testutils import compare_tensors, set_seed
+from testutils import compare_tensors, float64_buffers, move_as_to_mps, set_seed
 
 from torch_harmonics import GeometricRadialGrid, LegendreGaussRadialGrid, SphericalProductGrid, as_grid
 from torch_harmonics.examples import RadialPoissonDataset
@@ -92,6 +91,13 @@ def solve_radial(solver, f_radial):
     """Broadcast a radial profile over the sphere, solve, and read one column back."""
     field = f_radial.reshape(-1, 1, 1).expand(solver.nr, solver.nlat, solver.nlon).contiguous()
     return solver.solve(field.unsqueeze(0)).squeeze(0)[:, 0, 0]
+
+
+# Error budget in ULPs of the largest reference entry (see testutils.range_atol) for a solve
+# that should match the float64 one up to the rounding of the precision it ran in. The
+# discretization-error tests below measure accuracy and convergence order instead.
+# Measured: 1.6 ULPs of the precision the solve ran in.
+_PRECISION_ULPS = 32
 
 
 def relative_error(actual, expected):
@@ -205,18 +211,18 @@ class TestRadialPoissonSolver(unittest.TestCase):
         ratio = (u[0].abs().max() / u.abs().max()).item()
         self.assertLess(ratio, 1e-2, f"u on the innermost node is {ratio:.2e} of its maximum on degree {l}")
 
-    # solver dtype, input dtype, and the tolerance relative to the solution's maximum. A
-    # float32 solve agrees with the float64 one to a few 1e-7; 1e-5 leaves room for the
-    # accumulation order of other devices
+    # solver dtype and input dtype. A float32 solve agrees with the float64 one to a couple of
+    # ULPs of the solution's maximum; _PRECISION_ULPS leaves room for the accumulation order of
+    # other devices
     @parameterized.expand(
         [
-            [torch.float64, torch.float64, 1e-12],
-            [torch.float64, torch.float32, 1e-5],
-            [torch.float32, torch.float32, 1e-5],
-            [torch.float32, torch.float64, 1e-5],
+            [torch.float64, torch.float64],
+            [torch.float64, torch.float32],
+            [torch.float32, torch.float32],
+            [torch.float32, torch.float64],
         ]
     )
-    def test_solve_in_any_precision(self, solver_dtype, input_dtype, tol, verbose=False):
+    def test_solve_in_any_precision(self, solver_dtype, input_dtype, verbose=False):
         """
         The solve runs in the precision of its input, and agrees with a float64 solve.
 
@@ -232,8 +238,13 @@ class TestRadialPoissonSolver(unittest.TestCase):
         expected = reference.solve(source.double().unsqueeze(0)).squeeze(0)
 
         self.assertEqual(out.dtype, input_dtype)
-        error = relative_error(out.double(), expected)
-        self.assertLess(error, tol, f"relative error {error:.3e} of a {input_dtype} solve by a {solver_dtype} solver")
+        # a float32 solver or input rounds the whole solve to float32
+        eps_dtype = torch.float64 if solver_dtype == input_dtype == torch.float64 else torch.float32
+        self.assertTrue(
+            compare_tensors(
+                f"{input_dtype} solve by a {solver_dtype} solver", out.double(), expected, atol=0.0, rtol=0.0, ulps=_PRECISION_ULPS, eps_dtype=eps_dtype, verbose=verbose
+            )
+        )
 
     @parameterized.expand([[17, True], [18, False]])
     def test_bump_source_needs_a_node_in_every_bump(self, nr, refused):
@@ -324,8 +335,7 @@ class TestRadialPoissonSolver(unittest.TestCase):
 
         reference = make_solver(64, rmin=1e-1, device=self.device)
         expected = reference.solve((inp.double() / reference.r.reshape(-1, 1, 1) ** 2).unsqueeze(0)).squeeze(0)
-        error = relative_error(tar.double(), expected)
-        self.assertLess(error, 1e-5, f"relative error {error:.3e} of the {source} target")
+        self.assertTrue(compare_tensors(f"{source} target", tar.double(), expected, atol=0.0, rtol=0.0, ulps=_PRECISION_ULPS, eps_dtype=torch.float32))
 
     @parameterized.expand([["bump", 1e-1, 1e3], ["ball", 1e10, 1e11]])
     def test_dataset_normalizes_to_unit_rms(self, source, rmin, rmax):
@@ -359,10 +369,8 @@ class TestRadialPoissonSolver(unittest.TestCase):
         source = solver.random_bump_source(nblobs=2, dtype=torch.float32)
         expected = solver.solve(source.unsqueeze(0))
 
-        # pretend the CPU is such a device, so the move takes the MPS path here
-        with mock.patch("torch_harmonics.utils._NO_FLOAT64_DEVICE_TYPES", frozenset({"cpu"})):
-            solver = solver.to("cpu")
-        self.assertFalse([name for name, b in solver.named_buffers() if b.dtype == torch.float64])
+        solver = move_as_to_mps(solver)
+        self.assertFalse(float64_buffers(solver))
         # the buffers were cast to float32 at use before the move, so nothing changes
         self.assertTrue(torch.equal(solver.solve(source.unsqueeze(0)), expected))
         self.assertEqual(solver.random_bump_source(nblobs=2, dtype=torch.float32).dtype, torch.float32)
@@ -383,7 +391,3 @@ class TestRadialPoissonSolver(unittest.TestCase):
         """The angular grid alone has no radial nodes to solve on."""
         with self.assertRaisesRegex(TypeError, "SphericalProductGrid"):
             RadialPoissonSolver(as_grid("legendre-gauss", nlat=16, nlon=32))
-
-
-if __name__ == "__main__":
-    unittest.main()

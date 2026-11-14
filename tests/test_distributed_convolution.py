@@ -36,10 +36,11 @@ import torch
 import torch.distributed as dist
 from parameterized import parameterized
 from testutils import (
+    amp_ulps,
     compare_tensors,
-    disable_tf32,
     gather_tensor_hw,
     maybe_autocast,
+    param_grad_ulps,
     reduce_success,
     set_seed,
     setup_class_from_context,
@@ -70,6 +71,30 @@ _SLOW_DISCO_SHAPES = frozenset(
 # shared state
 _DIST_CTX = {}
 
+_DOUBLE_BACKWARD_SHAPES = [
+    # nlat_in, nlon_in, nlat_out, nlon_out, kernel_shape, basis_type, transpose, fused, polar_mode
+    [33, 64, 33, 64, (3), "piecewise linear", False, False, "halo-exchange"],
+    [33, 64, 33, 64, (3), "piecewise linear", False, True, "halo-exchange"],
+    [33, 64, 17, 32, (3, 4), "harmonic", False, False, "halo-exchange"],
+    [33, 64, 17, 32, (3, 4), "harmonic", False, True, "halo-exchange"],
+    [33, 64, 33, 64, (3), "piecewise linear", False, False, "reduce-scatter"],
+    [33, 64, 33, 64, (3), "piecewise linear", False, True, "reduce-scatter"],
+    [17, 32, 33, 64, (3), "piecewise linear", True, False, None],
+    [33, 64, 33, 64, (3, 4), "harmonic", True, False, None],
+]
+
+# float64, and fp16/bf16 under autocast of an fp32 layer
+_DOUBLE_BACKWARD_CASES = [shape + [dtype] for shape in _DOUBLE_BACKWARD_SHAPES for dtype in (torch.float64, torch.float16, torch.bfloat16)]
+
+
+def _ulps(dtype):
+    """
+    ULP budget, of max|ref| in ``dtype``, for the output and input gradient. fp32/fp64: the
+    halo or reduce-scatter only reassociates the per-point contraction (measured: up to 3.9
+    ULPs on CPU and GB200). fp16/bf16: see amp_ulps. Parameter gradients use param_grad_ulps.
+    """
+    return amp_ulps(dtype) or 16.0
+
 
 def setUpModule():
     setup_module(_DIST_CTX)
@@ -85,7 +110,6 @@ class TestDistributedDiscreteContinuousConvolution(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         setup_class_from_context(cls, _DIST_CTX)
-        disable_tf32()
 
     def setUp(self):
         # Sync at test entry too — belt and braces. If a preceding test
@@ -153,10 +177,14 @@ class TestDistributedDiscreteContinuousConvolution(unittest.TestCase):
         — independently, so this works for any (h, w) grid layout and
         doesn't implicitly assume the world group equals h × w.
 
-        Returns a clone (allreduce is in-place) so the caller doesn't
-        mutate ``conv_dist.weight.grad`` and friends.
+        Returns a contiguous clone: allreduce is in-place, so the caller's
+        ``conv_dist.weight.grad`` and friends must not be mutated, and NCCL
+        rejects non-contiguous tensors. A gradient from ``torch.autograd.grad``
+        keeps the layout of the backward that produced it (the transpose
+        convolution's weight gradient is a permuted view); only ``.grad`` is
+        laid out like the parameter.
         """
-        out = tensor.clone()
+        out = tensor.contiguous().clone()
         if self.grid_size_h > 1:
             dist.all_reduce(out, group=self.h_group)
         if self.grid_size_w > 1:
@@ -185,90 +213,90 @@ class TestDistributedDiscreteContinuousConvolution(unittest.TestCase):
         [
             # ---- fused=False : standard a2a (K-expanded saved for backward) ----
             # fp32
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 64, 128, 32, 8, (3, 2), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 32, 64, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 2, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange"],
+            [64, 128, 64, 128, 32, 8, (3, 2), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange"],
+            [64, 128, 32, 64, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange"],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 2, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange"],
             # a channel count that is not a multiple of the azimuth split, so the a2a has to
             # cope with unequal per-rank shares. 10 rather than a smaller odd number because
             # the split has to stay non-empty on every rank: 6 over 8 azimuth ranks leaves the
             # last two with nothing and the split itself raises.
-            [64, 128, 64, 128, 32, 10, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange", 1e-6, 1e-5],
-            [65, 128, 65, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 64, 128, 32, 8, (3, 2), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 128, 256, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange", 1e-6, 1e-5],
-            [65, 128, 65, 128, 32, 8, (3, 4), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
-            [65, 128, 65, 128, 32, 8, (3, 4), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange", 1e-6, 1e-5],
-            [65, 128, 33, 64, 32, 8, (3, 4), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
+            [64, 128, 64, 128, 32, 10, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange"],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange"],
+            [65, 128, 65, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange"],
+            [64, 128, 64, 128, 32, 8, (3, 2), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange"],
+            [64, 128, 128, 256, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange"],
+            [65, 128, 65, 128, 32, 8, (3, 4), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange"],
+            [65, 128, 65, 128, 32, 8, (3, 4), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange"],
+            [65, 128, 33, 64, 32, 8, (3, 4), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange"],
             # group coverage: depthwise (groups == n_channels) and a groupsize>1
             # split (C=12, groups=3 -> groupsize=4).
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 8, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 64, 128, 32, 12, (3), "piecewise linear", "mean", 3, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 8, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange"],
+            [64, 128, 64, 128, 32, 12, (3), "piecewise linear", "mean", 3, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange"],
             # fp64
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float64, False, False, "halo-exchange", 1e-6, 1e-6],
-            [64, 128, 32, 64, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float64, False, False, "halo-exchange", 1e-6, 1e-6],
-            [64, 128, 64, 128, 32, 8, (3, 2), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float64, True, False, "halo-exchange", 1e-6, 1e-6],
-            [65, 128, 65, 128, 32, 8, (3, 4), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float64, False, False, "halo-exchange", 1e-6, 1e-6],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float64, False, False, "halo-exchange"],
+            [64, 128, 32, 64, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float64, False, False, "halo-exchange"],
+            [64, 128, 64, 128, 32, 8, (3, 2), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float64, True, False, "halo-exchange"],
+            [65, 128, 65, 128, 32, 8, (3, 4), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float64, False, False, "halo-exchange"],
             # non-equiangular grids at regular resolution. These are the rows where the
             # default theta_cutoff is derived from a node distribution that is not uniform
             # in theta, so the polar halo differs from the pi/(nlat-1) assumption. The only
             # other non-equiangular case in this file is ERA5-sized and slow-gated, which
             # left the distributed halo/split bookkeeping untested on these grids.
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "lobatto", "lobatto", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 32, 64, 32, 8, (3), "piecewise linear", "mean", 1, "lobatto", "lobatto", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 32, 64, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "legendre-gauss", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 128, 256, 32, 8, (3), "piecewise linear", "mean", 1, "lobatto", "lobatto", torch.float32, True, False, "halo-exchange", 1e-6, 1e-5],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "lobatto", "lobatto", torch.float32, False, False, "halo-exchange"],
+            [64, 128, 32, 64, 32, 8, (3), "piecewise linear", "mean", 1, "lobatto", "lobatto", torch.float32, False, False, "halo-exchange"],
+            [64, 128, 32, 64, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "legendre-gauss", torch.float32, False, False, "halo-exchange"],
+            [64, 128, 128, 256, 32, 8, (3), "piecewise linear", "mean", 1, "lobatto", "lobatto", torch.float32, True, False, "halo-exchange"],
             # trapezoidal is equispaced in cos(theta), so its default cutoff is
             # ~5x wider than the other grids at the same nlat and psi is correspondingly
             # denser. batch_size/num_chan dialed down to keep the working set bounded.
-            [64, 128, 64, 128, 2, 8, (3), "piecewise linear", "mean", 1, "trapezoidal", "trapezoidal", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
+            [64, 128, 64, 128, 2, 8, (3), "piecewise linear", "mean", 1, "trapezoidal", "trapezoidal", torch.float32, False, False, "halo-exchange"],
             # ERA5-like grids, gated behind TORCH_HARMONICS_RUN_SLOW_TESTS=1.
             # batch_size and num_chan dialed down (2, 8) vs the rest of the suite (32, 8)
             # to keep the working set under a few GB at these resolutions.
-            [721, 1440, 721, 1440, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
-            [721, 1440, 360, 720, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "legendre-gauss", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5],
+            [721, 1440, 721, 1440, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange"],
+            [721, 1440, 360, 720, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "legendre-gauss", torch.float32, False, False, "halo-exchange"],
             # ---- fused=True : reordered a2a (CUDA + optimized kernels) ----
             # non-transpose only; downsample + harmonic.
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 64, 128, 32, 8, (3, 2), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 32, 64, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange", 1e-6, 1e-5],
-            [65, 128, 65, 128, 32, 8, (3, 4), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange", 1e-6, 1e-5],
-            [65, 128, 33, 64, 32, 8, (3, 4), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange", 1e-6, 1e-5],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange"],
+            [64, 128, 64, 128, 32, 8, (3, 2), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange"],
+            [64, 128, 32, 64, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange"],
+            [65, 128, 65, 128, 32, 8, (3, 4), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange"],
+            [65, 128, 33, 64, 32, 8, (3, 4), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange"],
             # group coverage for the padded grouped path:
             #  groups=1            -> within-group channel split (no padding)
             #  groups=2 (gs=4)     -> split cuts a group at az>=4 (padding)
             #  groups=3,C=12 (gs=4)-> split cuts a group at az=2 and az=4 (padding)
             #  groups=C (gs=1)     -> depthwise; every channel a group (no-pad fast path)
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 2, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 64, 128, 32, 12, (3), "piecewise linear", "mean", 3, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange", 1e-6, 1e-5],
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 8, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange", 1e-6, 1e-5],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 2, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange"],
+            [64, 128, 64, 128, 32, 12, (3), "piecewise linear", "mean", 3, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange"],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 8, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange"],
             # ---- AMP (fp16/bf16) ----
             # Each dtype runs fused off AND on (non-transpose). The transpose
             # class has no ``fused`` argument, so it runs fused=False only
             # (fused=True there would be an identical duplicate).
             # fp16
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float16, False, False, "halo-exchange", 2e-2, 1e-2],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float16, False, False, "halo-exchange"],
             # Harmonic AMP rows exercise distributed kpacked tensor-core paths:
             # (2,2) -> K=4 -> K_PAD=8; (3,3) -> K=9 -> K_PAD=16.
-            [64, 128, 64, 128, 8, 8, (2, 2), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float16, False, False, "halo-exchange", 5e-2, 1e-2],
-            [64, 128, 64, 128, 8, 8, (3, 3), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float16, False, False, "halo-exchange", 5e-2, 1e-2],
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float16, False, True, "halo-exchange", 2e-2, 1e-2],
-            [64, 128, 64, 128, 8, 8, (2, 2), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float16, False, True, "halo-exchange", 5e-2, 1e-2],
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float16, True, False, "halo-exchange", 2e-2, 1e-2],
+            [64, 128, 64, 128, 8, 8, (2, 2), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float16, False, False, "halo-exchange"],
+            [64, 128, 64, 128, 8, 8, (3, 3), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float16, False, False, "halo-exchange"],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float16, False, True, "halo-exchange"],
+            [64, 128, 64, 128, 8, 8, (2, 2), "harmonic", "mean", 1, "equiangular", "equiangular", torch.float16, False, True, "halo-exchange"],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float16, True, False, "halo-exchange"],
             # bf16
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.bfloat16, False, False, "halo-exchange", 5e-2, 5e-2],
-            [64, 128, 64, 128, 8, 8, (2, 2), "harmonic", "mean", 1, "equiangular", "equiangular", torch.bfloat16, False, False, "halo-exchange", 3e-1, 5e-2],
-            [64, 128, 64, 128, 8, 8, (3, 3), "harmonic", "mean", 1, "equiangular", "equiangular", torch.bfloat16, False, False, "halo-exchange", 3e-1, 5e-2],
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.bfloat16, False, True, "halo-exchange", 5e-2, 5e-2],
-            [64, 128, 64, 128, 8, 8, (2, 2), "harmonic", "mean", 1, "equiangular", "equiangular", torch.bfloat16, False, True, "halo-exchange", 3e-1, 5e-2],
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.bfloat16, True, False, "halo-exchange", 5e-2, 5e-2],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.bfloat16, False, False, "halo-exchange"],
+            [64, 128, 64, 128, 8, 8, (2, 2), "harmonic", "mean", 1, "equiangular", "equiangular", torch.bfloat16, False, False, "halo-exchange"],
+            [64, 128, 64, 128, 8, 8, (3, 3), "harmonic", "mean", 1, "equiangular", "equiangular", torch.bfloat16, False, False, "halo-exchange"],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.bfloat16, False, True, "halo-exchange"],
+            [64, 128, 64, 128, 8, 8, (2, 2), "harmonic", "mean", 1, "equiangular", "equiangular", torch.bfloat16, False, True, "halo-exchange"],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.bfloat16, True, False, "halo-exchange"],
             # The reduce-scatter fallback needs forward/backward coverage of its own: it is the
             # mode a wide cutoff forces, and before the halo became the default these rows were
             # the only thing exercising it end to end.
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "reduce-scatter", 1e-6, 1e-5],
-            [64, 128, 32, 64, 32, 8, (3, 3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "reduce-scatter", 1e-6, 1e-5],
-            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "reduce-scatter", 1e-6, 1e-5],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "reduce-scatter"],
+            [64, 128, 32, 64, 32, 8, (3, 3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "reduce-scatter"],
+            [64, 128, 64, 128, 32, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "reduce-scatter"],
             # ---- optimized_kernel=False : the pure-PyTorch fallback ----
             # Every row above runs with the extension built, so the fallback is untested in CI
             # even though the base class selects it automatically on any install without the
@@ -284,16 +312,16 @@ class TestDistributedDiscreteContinuousConvolution(unittest.TestCase):
             # and is orders of magnitude slower. What these rows check is index bookkeeping,
             # which is resolution-independent, so the smallest grid that still splits across
             # polar ranks is enough.
-            [32, 64, 16, 32, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange", 1e-6, 1e-5, False],
-            [32, 64, 32, 64, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "reduce-scatter", 1e-6, 1e-5, False],
+            [32, 64, 16, 32, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "halo-exchange", False],
+            [32, 64, 32, 64, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, False, "reduce-scatter", False],
             # fused=True on the reference: the reordered all-to-all is kept, and the intermediate
             # is saved rather than recomputed, which only the compiled kernels can do
-            [32, 64, 16, 32, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange", 1e-6, 1e-5, False],
+            [32, 64, 16, 32, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, False, True, "halo-exchange", False],
             # The transpose convolution's fallback is a separate code path (it gathers the
             # polar split and contracts a COO psi over the output grid), and the rows above
             # never reach it. Upsampling and same-shape; it has no polar_mode.
-            [16, 32, 32, 64, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange", 1e-6, 1e-5, False],
-            [32, 64, 32, 64, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange", 1e-6, 1e-5, False],
+            [16, 32, 32, 64, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange", False],
+            [32, 64, 32, 64, 2, 8, (3), "piecewise linear", "mean", 1, "equiangular", "equiangular", torch.float32, True, False, "halo-exchange", False],
         ],
         skip_on_empty=True,
     )
@@ -315,8 +343,6 @@ class TestDistributedDiscreteContinuousConvolution(unittest.TestCase):
         transpose,
         fused,
         polar_mode,
-        atol,
-        rtol,
         optimized_kernel=True,
         verbose=True,
     ):
@@ -415,38 +441,32 @@ class TestDistributedDiscreteContinuousConvolution(unittest.TestCase):
 
         # evaluate FWD pass
         out_gather_full = self._gather_helper_fwd(out_local, conv_dist)
-        ok = compare_tensors("output", out_full, out_gather_full, atol=atol, rtol=rtol, verbose=verbose)
+        ok = compare_tensors("output", out_gather_full, out_full, atol=0.0, rtol=0.0, ulps=_ulps(dtype), eps_dtype=dtype, verbose=verbose)
         self.assertTrue(reduce_success(ok, self.device), "output")
 
         # evaluate BWD pass
         igrad_gather_full = self._gather_helper_bwd(igrad_local, conv_dist)
-        ok = compare_tensors("gradients", igrad_full, igrad_gather_full, atol=atol, rtol=rtol, verbose=verbose)
+        ok = compare_tensors("gradients", igrad_gather_full, igrad_full, atol=0.0, rtol=0.0, ulps=_ulps(dtype), eps_dtype=dtype, verbose=verbose)
         self.assertTrue(reduce_success(ok, self.device), "gradients")
 
         # evaluate parameter gradients — local per-rank contributions
         # summed across the h and w groups must match the serial gradient.
-        # Parameter grads are sums over batch + local spatial → accumulate
-        # reduction noise that per-element output / input-grad checks
-        # don't see. Use a higher factor for fp32 (where the base tolerance
-        # is tight at 1e-6/1e-5 and H100's a2a reductions can drift up to
-        # ~5e-3 absolute) than for AMP (where the base is already 4–5
-        # orders of magnitude looser; the same factor would make the
-        # bound meaninglessly large).
-        param_grad_tol_factor = 10.0 if is_amp else 1000.0
-        pg_atol, pg_rtol = atol * param_grad_tol_factor, rtol * param_grad_tol_factor
-        if dtype == torch.bfloat16 and basis_type == "piecewise linear":
-            # bf16 parameter gradients accumulate over batch and distributed
-            # spatial shards. Keep output/dgrad tolerances tight, but allow
-            # small absolute drift near zero-valued weight-gradient entries.
-            pg_atol = max(pg_atol, 3.0)
+        # Parameter grads are sums over batch and the whole grid, reassociated
+        # across ranks, so their absolute rounding error scales with the
+        # largest entries rather than the entry it lands on: entries that
+        # cancel to ~0 carry the same error as their neighbours. The atol is
+        # therefore floored at ULPs of max|ref|, see param_grad_ulps.
+        pg_ulps = param_grad_ulps(B * max(nlat_in * nlon_in, nlat_out * nlon_out), dtype)
         if conv_dist.weight.grad is not None:
             wgrad = self._allreduce_param_grad(conv_dist.weight.grad)
-            self.assertTrue(compare_tensors("weight grad", conv_local.weight.grad, wgrad, atol=pg_atol, rtol=pg_rtol, verbose=verbose))
+            ok = compare_tensors("weight grad", wgrad, conv_local.weight.grad, atol=0.0, rtol=0.0, verbose=verbose, ulps=pg_ulps, eps_dtype=dtype)
+            self.assertTrue(reduce_success(ok, self.device), "weight grad")
         if getattr(conv_dist, "bias", None) is not None and conv_dist.bias.grad is not None:
             bgrad = self._allreduce_param_grad(conv_dist.bias.grad)
-            self.assertTrue(compare_tensors("bias grad", conv_local.bias.grad, bgrad, atol=pg_atol, rtol=pg_rtol, verbose=verbose))
+            ok = compare_tensors("bias grad", bgrad, conv_local.bias.grad, atol=0.0, rtol=0.0, verbose=verbose, ulps=pg_ulps, eps_dtype=dtype)
+            self.assertTrue(reduce_success(ok, self.device), "bias grad")
 
-    def _run_kpacked_fallback(self, fused: bool, dtype: torch.dtype, atol: float, rtol: float):
+    def _run_kpacked_fallback(self, fused: bool, dtype: torch.dtype):
         """Shared body for kpacked-fallback tests.
 
         Rules the kpacked backend out, so the distributed conv runs the arc kernels even
@@ -501,24 +521,24 @@ class TestDistributedDiscreteContinuousConvolution(unittest.TestCase):
 
         verbose = self.world_rank == 0
         out_gather = self._gather_helper_fwd(out_local, conv_dist)
-        ok = compare_tensors("output", out_full, out_gather, atol=atol, rtol=rtol, verbose=verbose)
+        ok = compare_tensors("output", out_gather, out_full, atol=0.0, rtol=0.0, ulps=_ulps(dtype), eps_dtype=dtype, verbose=verbose)
         self.assertTrue(reduce_success(ok, self.device), "output")
 
         igrad_gather = self._gather_helper_bwd(igrad_local, conv_dist)
-        ok = compare_tensors("gradients", igrad_full, igrad_gather, atol=atol, rtol=rtol, verbose=verbose)
+        ok = compare_tensors("gradients", igrad_gather, igrad_full, atol=0.0, rtol=0.0, ulps=_ulps(dtype), eps_dtype=dtype, verbose=verbose)
         self.assertTrue(reduce_success(ok, self.device), "gradients")
 
     def test_kpacked_fallback_bf16_unfused(self):
         """bf16 + kpacked ruled out → arc kernels, fused=False."""
-        self._run_kpacked_fallback(fused=False, dtype=torch.bfloat16, atol=5e-2, rtol=5e-2)
+        self._run_kpacked_fallback(fused=False, dtype=torch.bfloat16)
 
     def test_kpacked_fallback_bf16_fused(self):
         """bf16 + kpacked ruled out → arc kernels, fused=True."""
-        self._run_kpacked_fallback(fused=True, dtype=torch.bfloat16, atol=5e-2, rtol=5e-2)
+        self._run_kpacked_fallback(fused=True, dtype=torch.bfloat16)
 
     def test_kpacked_fallback_fp16_unfused(self):
         """fp16 + kpacked ruled out → arc kernels, fused=False."""
-        self._run_kpacked_fallback(fused=False, dtype=torch.float16, atol=2e-2, rtol=1e-2)
+        self._run_kpacked_fallback(fused=False, dtype=torch.float16)
 
     @parameterized.expand(
         [
@@ -726,6 +746,30 @@ class TestDistributedDiscreteContinuousConvolution(unittest.TestCase):
             dist.all_reduce(local_nnz, group=self.h_group)
         self.assertEqual(int(local_nnz.item()), int(ser_vals.numel()), "polar ranks together must hold every serial psi entry exactly once")
 
+    @parameterized.expand([["forward", "reduce-scatter"], ["forward", "halo-exchange"], ["transpose", None]])
+    def test_identical_layers_share_their_block(self, direction, polar_mode):
+        """
+        Two identical distributed DISCO layers share this rank's backend state, the backend
+        included; one with a different support does not. See BackendSelectionMixin.
+        """
+        g_in, g_out = th.as_grid("equiangular", nlat=32, nlon=64), th.as_grid("equiangular", nlat=16, nlon=32)
+        if direction == "transpose":
+
+            def build(**kwargs):
+                return thd.DistributedDiscreteContinuousConvTransposeS2(g_out, g_in, 4, 4, kernel_shape=3, **kwargs).to(self.device)
+
+        else:
+
+            def build(**kwargs):
+                return thd.DistributedDiscreteContinuousConvS2(g_in, g_out, 4, 4, kernel_shape=3, polar_mode=polar_mode, **kwargs).to(self.device)
+
+        a, b = build(), build()
+        self.assertIs(a.backend, b.backend)
+        for name in a._backend_state:
+            self.assertIs(getattr(a, name), getattr(b, name), msg=name)
+        other = build(theta_cutoff=1.5 * a.theta_cutoff)
+        self.assertTrue(any(getattr(a, name) is not getattr(other, name) for name in a._backend_state))
+
     def test_fused_runs_on_every_backend(self):
         """
         fused=True is accepted wherever the layer can be built, the torch reference included:
@@ -746,6 +790,66 @@ class TestDistributedDiscreteContinuousConvolution(unittest.TestCase):
             )
         self.assertIn("halo-exchange", str(ctx.exception))
 
+    @parameterized.expand(_DOUBLE_BACKWARD_CASES, skip_on_empty=True)
+    def test_distributed_disco_conv_double_backward(self, nlat_in, nlon_in, nlat_out, nlon_out, kernel_shape, basis_type, transpose, fused, polar_mode, dtype, verbose=False):
+        """Gradient of the penalty |dL/dx|^2 through the distributed convolution, against the serial one.
 
-if __name__ == "__main__":
-    unittest.main()
+        L is a sum of tanh of the output, so its Hessian couples output points through the
+        convolution and the penalty gradient crosses every halo, reduce-scatter and
+        all-to-all the layer communicates through. The bounded tanh keeps the second-order
+        gradients within fp16 range; a cubic overflows the penalty weight gradient there. On uneven latitude splits, in float64,
+        and for fp16 and bf16 with an fp32 layer and input under ``maybe_autocast``, as the
+        first-order autocast tests run. The loss is evaluated under autocast and both
+        gradients outside it, and the gradients must come back in the dtype of the input
+        and of the weight.
+        """
+        set_seed(333)
+        B, C = 2, 4
+        # the layer and the input stay fp32 for the autocast cases; only maybe_autocast lowers the precision
+        module_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+        disco_args = dict(
+            in_channels=C,
+            out_channels=C,
+            basis_type=basis_type,
+            kernel_shape=kernel_shape,
+            grid_in=th.as_grid("equiangular", nlat=nlat_in, nlon=nlon_in),
+            grid_out=th.as_grid("equiangular", nlat=nlat_out, nlon=nlon_out),
+            bias=False,
+        )
+        if transpose:
+            conv_local = th.DiscreteContinuousConvTransposeS2(**disco_args).to(dtype=module_dtype, device=self.device)
+            conv_dist = thd.DistributedDiscreteContinuousConvTransposeS2(**disco_args).to(dtype=module_dtype, device=self.device)
+        else:
+            conv_local = th.DiscreteContinuousConvS2(**disco_args).to(dtype=module_dtype, device=self.device)
+            conv_dist = thd.DistributedDiscreteContinuousConvS2(**disco_args, fused=fused, polar_mode=polar_mode).to(dtype=module_dtype, device=self.device)
+        with torch.no_grad():
+            conv_dist.weight.copy_(conv_local.weight)
+
+        def penalty_grads(conv, x, reduce_fn):
+            with maybe_autocast(self.device.type, dtype):
+                loss = reduce_fn(torch.sum(torch.tanh(conv(x))))
+            (g,) = torch.autograd.grad(loss, x, create_graph=True)
+            hx, hw = torch.autograd.grad(reduce_fn(torch.sum(g * g)), (x, conv.weight))
+            return g.detach(), hx, hw
+
+        def reduce_hw(t):
+            return thd.reduce_from_azimuth_region(thd.reduce_from_polar_region(t))
+
+        inp_full = torch.randn((B, C, nlat_in, nlon_in), dtype=module_dtype, device=self.device)
+        g_full, hx_full, hw_full = penalty_grads(conv_local, inp_full.clone().requires_grad_(True), lambda t: t)
+        g_local, hx_local, hw_local = penalty_grads(conv_dist, self._split_helper(inp_full).clone().requires_grad_(True), reduce_hw)
+
+        # the gradients come back in the dtype of what they are taken with respect to
+        for name, t in (("gradients", g_local), ("penalty input grad", hx_local)):
+            self.assertEqual(t.dtype, module_dtype, f"{name} dtype")
+        self.assertEqual(hw_local.dtype, conv_dist.weight.dtype, "penalty weight grad dtype")
+
+        verbose = verbose and self.world_rank == 0
+        ulps = _ulps(dtype)
+        ok = compare_tensors("gradients", self._gather_helper_bwd(g_local, conv_dist), g_full, atol=0.0, rtol=0.0, ulps=ulps, eps_dtype=dtype, verbose=verbose)
+        self.assertTrue(reduce_success(ok, self.device), "gradients")
+        ok = compare_tensors("penalty input grad", self._gather_helper_bwd(hx_local, conv_dist), hx_full, atol=0.0, rtol=0.0, ulps=ulps, eps_dtype=dtype, verbose=verbose)
+        self.assertTrue(reduce_success(ok, self.device), "penalty input grad")
+        pg_ulps = param_grad_ulps(B * max(nlat_in * nlon_in, nlat_out * nlon_out), dtype)
+        ok = compare_tensors("penalty weight grad", self._allreduce_param_grad(hw_local), hw_full, atol=0.0, rtol=0.0, ulps=pg_ulps, eps_dtype=dtype, verbose=verbose)
+        self.assertTrue(reduce_success(ok, self.device), "penalty weight grad")

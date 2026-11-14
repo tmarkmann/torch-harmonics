@@ -29,12 +29,61 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-from typing import Optional
+r"""
+Longitudinal Fourier transforms.
+
+:func:`rfft` and :func:`irfft` wrap ``torch.fft`` with the padding and truncation an SHT
+needs on a regular grid. :class:`RingFFT` is the same step on a ragged
+:class:`~torch_harmonics.grid.GridS2` such as HEALPix.
+
+On a regular grid every ring has ``nlon`` points, so the longitudinal step of an SHT is
+one batched ``rfft`` over the last axis of an ``(nlat, nlon)`` field. On a ragged grid
+such as HEALPix the rings differ in length and are offset by a fraction of a point, and
+the field is stored flat as ``(npoints,)`` in ring order. :class:`RingFFT` provides the
+same step for such a grid: it maps a flat field to the Fourier coefficients
+:math:`F_m(\theta_k)`, ``m < mmax``, of every ring, shaped ``(nrings, mmax)``, and back.
+
+**Analysis.** Ring :math:`k` holds :math:`n_k` points at
+:math:`\lambda_j = \lambda_{0,k} + 2\pi j / n_k`. Its coefficient of order :math:`m` is
+
+.. math::
+
+    F_m(\theta_k) = \frac{1}{n_k} \sum_{j=0}^{n_k - 1} f_{kj}\, e^{-i m \lambda_j}
+                  = e^{-i m \lambda_{0,k}}\, \hat{f}_{k,\, m \bmod n_k},
+
+where :math:`\hat f_k` is the forward-normalized DFT of the ring. Orders at or above
+:math:`n_k / 2` are not dropped but *aliased*: the bin ``m mod n_k`` is read from the
+``rfft`` output directly when it lies in its half spectrum, and as the conjugate of bin
+``n_k - (m mod n_k)`` otherwise. On HEALPix the short polar rings carry far fewer points
+than the transform has orders, so dropping the aliased orders, as a zero-padded ``rfft``
+would, is wrong there.
+
+**Synthesis** is the reverse. A real field with coefficients :math:`G_m`,
+:math:`0 \le m < m_{\max}`, has the two-sided expansion :math:`H_{\pm m}` with
+:math:`H_{-m} = \overline{G_m}`, and the ring's DFT bin :math:`b` receives every
+:math:`H_m` with :math:`m \equiv b \pmod{n_k}`. Each order is therefore *folded* into
+the half-spectrum bins it aliases to -- the positive frequency into ``m mod n_k`` and the
+negative one into ``(-m) mod n_k``, whichever of them lies in ``0 ... n_k / 2`` -- after
+the phase :math:`e^{i m \lambda_{0,k}}`. An ``irfft`` of each ring finishes the step.
+
+Both directions are exact. The ring FFTs are batched over the rings that share a length:
+one call per distinct length, which on HEALPix is a single call for the equatorial belt
+(two thirds of the pixels) and one per pair of mirrored polar-cap rings. The batches are
+laid out one after another: the forward gathers the pixels into that order once and splits
+them, and the inverse folds each ring straight into its batch's place, so no batch selects
+its rings out of the whole field or spectrum, which would cost a full-size scatter per ring
+length in the backward. The gathers and the fold are precomputed index tables, so a forward
+pass has no host synchronization.
+"""
+
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.fft as fft
 import torch.nn as nn
 
+from torch_harmonics.cache import SharedBufferMixin, shared_table
+from torch_harmonics.grid import GridS2
 from torch_harmonics.utils import ensure_contiguous
 
 
@@ -77,6 +126,11 @@ def irfft(x: torch.Tensor, n: Optional[int] = None, dim: int = -1, **kwargs) -> 
     if n is None:
         n = 2 * (x.size(dim) - 1)
 
+    # An explicitly sized empty spectrum synthesizes zero, retaining autograd.
+    # FFT backends require at least one input bin even when n is provided.
+    if x.size(dim) == 0 and n > 0:
+        x = _pad_dim_right(x, dim, 1)
+
     # Zero the imaginary part of the DC bin (and Nyquist bin if present) to
     # enforce Hermitian symmetry. We do this functionally via torch.complex()
     # rather than in-place assignment (x[..., k].imag = 0.0) because the
@@ -94,3 +148,252 @@ def irfft(x: torch.Tensor, n: Optional[int] = None, dim: int = -1, **kwargs) -> 
     x = ensure_contiguous(fft.irfft(x, n=n, dim=dim, **kwargs))
 
     return x
+
+
+def _ring_groups(nlon_per_lat: torch.Tensor) -> List[Tuple[int, torch.Tensor]]:
+    """Rings grouped by length, as ``(length, ring indices)`` in order of first appearance."""
+    lengths = nlon_per_lat.tolist()
+    groups = {}
+    for ring, n in enumerate(lengths):
+        groups.setdefault(n, []).append(ring)
+    return [(n, torch.tensor(rings, dtype=torch.int64)) for n, rings in groups.items()]
+
+
+@shared_table
+@torch.no_grad()
+def _ring_fft_tables(grid: GridS2, mmax: int, rmin: int, rmax: int) -> Dict[str, object]:
+    """
+    The index and phase tables of a :class:`RingFFT` over the rings ``[rmin, rmax)``, and the layout of its ring batches.
+
+    Depend on those rings and ``mmax`` only, so every ring FFT of the same grid, rings and
+    order count -- forward and inverse SHTs alike -- shares one set, see
+    :func:`~torch_harmonics.cache.shared_table`. The tensors are read-only. Pixel indices are
+    counted from the first pixel of ring ``rmin``.
+    """
+    nlon_per_lat = grid.nlon_per_lat[rmin:rmax].to(torch.int64)
+    offsets = grid.lon_offsets[rmin : rmax + 1].to(torch.int64)
+    offsets = offsets - offsets[0]
+    nrings = int(nlon_per_lat.numel())
+
+    # every ring's half spectrum fits into nbins bins
+    nbins = int(nlon_per_lat.max()) // 2 + 1
+
+    # -- ring batches --------------------------------------------------------
+    # One batch per distinct ring length, transformed by one FFT. The transforms work in
+    # batch order: the rings of the first batch, then those of the second, and so on.
+    # A field is brought into it by one gather of its pixels and split into the batches,
+    # and a spectrum is folded directly into it, so no batch ever selects its rings out
+    # of the whole field or spectrum. Each such select would have a backward that
+    # scatters into a full-size zero tensor, once per ring length: hundreds of full-size
+    # passes on HEALPix, which has a ring length per polar ring pair.
+    lengths = []
+    counts = []
+    batch_rings = []
+    for n, rings in _ring_groups(nlon_per_lat):
+        lengths.append(n)
+        counts.append(rings.numel())
+        batch_rings.append(rings)
+
+    # ring_order[s] is the ring in slot s of the batch order, slot[r] the slot of ring r
+    ring_order = torch.cat(batch_rings)
+    slot = torch.argsort(ring_order)
+    pixel_order = torch.cat([(offsets[rings].unsqueeze(-1) + torch.arange(n, dtype=torch.int64)).reshape(-1) for n, rings in zip(lengths, batch_rings)])
+    # a regular grid is a single batch in pixel order already, which needs no gather
+    identity = bool(torch.equal(pixel_order, torch.arange(pixel_order.numel(), dtype=torch.int64)))
+
+    # -- alias tables --------------------------------------------------------
+    # indexed by ring, pointing at the ring's slot in the batch order
+    n = nlon_per_lat.unsqueeze(-1)
+    m = torch.arange(mmax, dtype=torch.int64).unsqueeze(0)
+    ring = slot.unsqueeze(-1)
+    half = n // 2
+
+    # analysis: order m reads bin m mod n, or the conjugate of bin n - (m mod n)
+    k = torch.remainder(m, n)
+    conj = k > half
+    k = torch.where(conj, n - k, k)
+
+    # synthesis: positive frequency m to bin m mod n, negative frequency -m to bin
+    # (-m) mod n, each dropped into a trailing dump bin when it falls outside the half
+    # spectrum, and -0 dropped altogether since m = 0 has no separate negative part
+    stride = nbins + 1
+    dump = ring * stride + nbins
+    k_pos = torch.remainder(m, n)
+    k_neg = torch.remainder(-m, n)
+    pos = torch.where(k_pos <= half, ring * stride + k_pos, dump)
+    neg = torch.where((k_neg <= half) & (m > 0), ring * stride + k_neg, dump)
+
+    # the DC bin of a real ring, and the Nyquist bin of an even one, are real. Folding
+    # makes them so up to
+    # round-off, and the imaginary part of m = 0 is dropped by definition, so both are
+    # zeroed explicitly rather than left to the irfft backend. A precomputed mask
+    # rather than irfft's per-call one, which writes to the device from the host
+    # and would synchronize once per ring length.
+    # rows in batch order, like the folded spectrum
+    imag_mask = torch.ones(nrings, stride, dtype=torch.float64)
+    imag_mask[:, 0] = 0.0
+    # an odd ring has no Nyquist bin: its last bin n // 2 is an ordinary frequency
+    even = nlon_per_lat % 2 == 0
+    imag_mask[slot[even], nlon_per_lat[even] // 2] = 0.0
+
+    # ring phases e^{-i m lambda_0}, lambda_0 = 2 pi shift / n
+    lam0 = 2.0 * torch.pi * grid.lon_shifts[rmin:rmax].to(torch.float64) / nlon_per_lat.to(torch.float64)
+    angle = -m.to(torch.float64) * lam0.unsqueeze(-1)
+
+    return {
+        "nbins": nbins,
+        "lengths": tuple(lengths),
+        "counts": tuple(counts),
+        # None where no gather is needed: every tensor returned must be kept alive by the
+        # layer, or the shared entry is dropped and the next identical ring FFT rebuilds it
+        "pixel_order": None if identity else pixel_order,
+        "pixel_inverse": None if identity else torch.argsort(pixel_order),
+        "gather": (ring * nbins + k).reshape(-1),
+        "gather_sign": torch.where(conj, -1.0, 1.0).to(torch.float64),
+        "fold_pos": pos.reshape(-1),
+        "fold_neg": neg.reshape(-1),
+        "imag_mask": imag_mask.reshape(-1),
+        "phase_re": torch.cos(angle),
+        "phase_im": torch.sin(angle),
+    }
+
+
+class RingFFT(SharedBufferMixin, nn.Module):
+    r"""
+    Exact longitudinal Fourier transform of a field on the rings of a :class:`GridS2`.
+
+    See the :mod:`torch_harmonics.fft` module docstring for the definition. :meth:`forward` maps ``(..., npoints)``
+    to complex ``(..., nrings, mmax)`` coefficients, normalized like
+    ``torch.fft.rfft(norm="forward")``, and :meth:`inverse` maps them back, normalized
+    like ``torch.fft.irfft(norm="forward")``. On a regular grid :meth:`forward` equals
+    ``rfft`` for orders up to ``nlon / 2`` and aliases the ones above instead of
+    zeroing them; :meth:`inverse` equals ``irfft`` for orders below ``nlon / 2``. At and
+    above it, every order is a two-sided harmonic :math:`2\,\mathrm{Re}(G_m e^{i m
+    \lambda})`, the Nyquist order included, where ``irfft`` would take its bin
+    one-sided. On HEALPix those are genuine orders of the expansion on the short rings.
+
+    The index and phase tables are shared between all ring FFTs of the same grid and
+    ``mmax``, on every device; see :func:`~torch_harmonics.cache.shared_table`.
+
+    Parameters
+    ----------
+    grid : GridS2
+        The grid. Its :attr:`~torch_harmonics.grid.GridS2.nlon_per_lat`,
+        :attr:`~torch_harmonics.grid.GridS2.lon_offsets` and
+        :attr:`~torch_harmonics.grid.GridS2.lon_shifts` describe the rings.
+    mmax : int
+        Number of orders, non-inclusive.
+    rings : tuple of int, optional
+        The rings ``(rmin, rmax)`` to transform, a contiguous range of the grid's, by default
+        all of them. A distributed transform takes its band of rings, which in ring order is a
+        contiguous slice of the flat field: ``(..., npoints)`` then counts that band's pixels.
+    """
+
+    def __init__(self, grid: GridS2, mmax: int, rings: Optional[Tuple[int, int]] = None):
+        super().__init__()
+
+        total = int(grid.nlon_per_lat.numel())
+        rmin, rmax = (0, total) if rings is None else (int(rings[0]), int(rings[1]))
+        if not 0 <= rmin < rmax <= total:
+            raise ValueError(f"rings must be a non-empty range within [0, {total}), got {rings!r}")
+        self.rings = (rmin, rmax)
+        self.nrings = rmax - rmin
+        self.npoints = int(grid.lon_offsets[rmax]) - int(grid.lon_offsets[rmin])
+        self.mmax = int(mmax)
+
+        tables = _ring_fft_tables(grid, self.mmax, rmin, rmax)
+        self.nbins = tables["nbins"]
+        self._lengths = list(tables["lengths"])
+        self._counts = list(tables["counts"])
+        # pixels per batch, to split a field in batch order
+        self._sizes = [n * count for n, count in zip(self._lengths, self._counts)]
+        # no pixel permutation where the batch order is the pixel order, as on a regular grid
+        self._permuted = tables["pixel_order"] is not None
+        if self._permuted:
+            self.register_shared_buffer("_pixel_order", tables["pixel_order"])
+            self.register_shared_buffer("_pixel_inverse", tables["pixel_inverse"])
+        for name in ("gather", "gather_sign", "fold_pos", "fold_neg", "imag_mask", "phase_re", "phase_im"):
+            self.register_shared_buffer(f"_{name}", tables[name])
+
+    def extra_repr(self) -> str:
+        return f"rings={self.rings}, npoints={self.npoints}, mmax={self.mmax}, nbatches={len(self._lengths)}"
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Fourier coefficients of every ring.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Real field of shape ``(..., npoints)``, in ring order.
+
+        Returns
+        -------
+        torch.Tensor
+            Complex coefficients of shape ``(..., nrings, mmax)``.
+        """
+        lead = x.shape[:-1]
+
+        # bring the pixels into batch order, then rfft each batch of equal-length rings and
+        # pad its half spectrum to nbins. Splitting, not selecting, keeps the backward one cat.
+        if self._permuted:
+            x = x.index_select(-1, self._pixel_order)
+        spectra = []
+        for pixels, n, count in zip(torch.split(x, self._sizes, dim=-1), self._lengths, self._counts):
+            spectrum = torch.fft.rfft(pixels.reshape(*lead, count, n), dim=-1, norm="forward")
+            spectra.append(nn.functional.pad(spectrum, (0, self.nbins - spectrum.shape[-1])))
+        spectrum = torch.cat(spectra, dim=-2) if len(spectra) > 1 else spectra[0]
+
+        # alias gather from the batch order back to ring order, in real arithmetic:
+        # F = Re X + i * sign * Im X at the gathered bin
+        spectrum = spectrum.reshape(*lead, self.nrings * self.nbins)
+        dtype = spectrum.real.dtype
+        re = spectrum.real[..., self._gather].reshape(*lead, self.nrings, self.mmax)
+        im = spectrum.imag[..., self._gather].reshape(*lead, self.nrings, self.mmax) * self._gather_sign.to(dtype)
+
+        # ring phase
+        p_re = self._phase_re.to(dtype)
+        p_im = self._phase_im.to(dtype)
+        return torch.complex(re * p_re - im * p_im, re * p_im + im * p_re)
+
+    def inverse(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Synthesize the rings from their Fourier coefficients.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Complex coefficients of shape ``(..., nrings, mmax)``. The imaginary part of
+            ``m = 0`` is ignored, as by ``irfft``.
+
+        Returns
+        -------
+        torch.Tensor
+            Real field of shape ``(..., npoints)``, in ring order.
+        """
+        lead = x.shape[:-2]
+        dtype = x.real.dtype
+
+        # undo the ring phase: multiply by e^{+i m lambda_0}, the conjugate of the stored phase
+        p_re = self._phase_re.to(dtype)
+        p_im = self._phase_im.to(dtype)
+        re = x.real * p_re + x.imag * p_im
+        im = x.imag * p_re - x.real * p_im
+        re = re.reshape(*lead, self.nrings * self.mmax)
+        im = im.reshape(*lead, self.nrings * self.mmax)
+
+        # fold: H_m into bin m mod n and conj(H_m) into bin (-m) mod n, of the ring's slot in
+        # the batch order
+        size = self.nrings * (self.nbins + 1)
+        out_re = re.new_zeros(*lead, size).index_add(-1, self._fold_pos, re).index_add(-1, self._fold_neg, re)
+        out_im = im.new_zeros(*lead, size).index_add(-1, self._fold_pos, im).index_add(-1, self._fold_neg, -im)
+        out_im = out_im * self._imag_mask.to(dtype)
+        spectrum = torch.complex(out_re, out_im).reshape(*lead, self.nrings, self.nbins + 1)
+
+        # the spectrum is folded in batch order: irfft each batch of equal-length rings and
+        # restore pixel order. Splitting, not selecting, keeps the backward one cat.
+        fields = []
+        for rings, n in zip(torch.split(spectrum, self._counts, dim=-2), self._lengths):
+            fields.append(torch.fft.irfft(rings.narrow(-1, 0, n // 2 + 1), n=n, dim=-1, norm="forward").reshape(*lead, -1))
+        field = torch.cat(fields, dim=-1) if len(fields) > 1 else fields[0]
+        return field.index_select(-1, self._pixel_inverse) if self._permuted else field

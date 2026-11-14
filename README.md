@@ -128,15 +128,15 @@ cd torch-harmonics
 pip install --no-build-isolation -e .
 ```
 
-If CUDA devices are not detected automatically (e.g. inside a container), set the `TORCH_HARMONICS_BUILD_CUDA_EXTENSION` flag. Set `TORCH_CUDA_ARCH_LIST` to only the architectures you need to reduce compilation time:
+If CUDA devices are not detected automatically (e.g. inside a container), set the `TORCH_HARMONICS_BUILD_CUDA_EXTENSION` flag. Set `TORCH_CUDA_ARCH_LIST` to only the architectures you need to reduce compilation time. The example below needs CUDA 12.9 or newer; with CUDA 12.8 drop `10.3a`, and before 12.8 also drop `10.0a` and `12.0+PTX`, which those compilers do not support:
 
 ```bash
 export TORCH_HARMONICS_BUILD_CUDA_EXTENSION=1
-export TORCH_CUDA_ARCH_LIST="8.0 8.6 9.0a 10.0a+PTX"
+export TORCH_CUDA_ARCH_LIST="8.0 8.6 9.0a 10.0a 10.3a 12.0+PTX"
 pip install --no-build-isolation -e .
 ```
 
-> **Tip:** Use the `a` suffix (e.g. `9.0a`, `10.0a`) instead of plain `9.0` or `10.0` to enable architecture-specific tensor core instructions (e.g. `wgmma` on Hopper). Some layers such as DISCO benefit significantly from this. The trade-off is that the resulting binary is only compatible with the exact GPU generation it was compiled for.
+> **Tip:** Use the `a` suffix (e.g. `9.0a`, `10.0a`) instead of plain `9.0` or `10.0` to enable architecture-specific tensor core instructions (e.g. `wgmma` on Hopper). Some layers such as DISCO benefit significantly from this. The trade-off is that the resulting binary is only compatible with the exact GPU it was compiled for, and this includes `+PTX` on an `a` target: `10.0a` runs on GB200/B200 (10.0) but not on GB300/B300 (10.3), which needs `10.3a`.
 
 :warning: Custom CUDA extensions require architectures >= 7.0.
 
@@ -264,18 +264,26 @@ coordinates:
 </div>
 
 - **Equiangular**: rings equally spaced in latitude, including both poles, with Clenshaw-Curtis quadrature. This is the familiar latitude-longitude grid used for most reanalysis and climate data.
+- **Fejér-1**: pole-excluding rings with Fejér quadrature. Its direct-analysis default is `(nlat + 1) // 2`; folded analysis supports higher bandlimits within its recovery bounds.
 - **Legendre-Gauss**: rings at the roots of the Legendre polynomial in $\cos\theta$, excluding the poles. Gaussian quadrature is exact up to the highest polynomial degree for a given number of rings, so this grid supports the highest SHT bandlimit per ring.
 - **Lobatto**: Gauss-Lobatto nodes, i.e. Legendre-Gauss-like rings that include both poles.
 - **Trapezoidal**: rings equally spaced in $\cos\theta$ with the trapezoidal rule, which places them densely near the equator and sparsely near the poles. Its quadrature converges only algebraically, so it is suited for quadrature and localized operators but not for an SHT at a high bandlimit.
-- **HEALPix** [8]: `12 * nside**2` pixels of equal area on `4 * nside - 1` rings of constant latitude. The rings have different lengths, so a field is stored as a flat tensor of shape `(..., npix)` in RING order. HEALPix supports attention, DISCO convolutions and quadrature but not the SHT yet.
+- **HEALPix** [8]: `12 * nside**2` pixels of equal area on `4 * nside - 1` rings of constant latitude. The rings have different lengths, so a field is stored as a flat tensor of shape `(..., npix)` in RING order. HEALPix supports the scalar and vector SHTs, spectral convolutions, resampling, random fields, attention, DISCO convolutions and quadrature. Its SHT synthesis is exact, while its analysis is approximate: about 1e-2 relative error at the default `lmax = 2 * nside`, or about 1e-6 with `RealSHT(grid, iter=3)`. Of the distributed layers, the SHTs and `DistributedQuadratureS2` accept HEALPix, decomposed along latitude only (see below).
 
 | grid type          | class                                      | field shape    | accepted by                                              |
 | ------------------ | ------------------------------------------ | -------------- | -------------------------------------------------------- |
 | `"equiangular"`    | `th.EquiangularGrid(nlat=..., nlon=...)`   | `(nlat, nlon)` | every layer                                              |
+| `"fejer1"`         | `th.Fejer1Grid(nlat=..., nlon=...)`        | `(nlat, nlon)` | every layer                                              |
 | `"legendre-gauss"` | `th.LegendreGaussGrid(nlat=..., nlon=...)` | `(nlat, nlon)` | every layer                                              |
 | `"lobatto"`        | `th.LobattoGrid(nlat=..., nlon=...)`       | `(nlat, nlon)` | every layer                                              |
 | `"trapezoidal"`    | `th.TrapezoidalGrid(nlat=..., nlon=...)`   | `(nlat, nlon)` | every layer                                              |
-| `"healpix"`        | `th.HealpixGrid(nside=...)`                | `(npix,)`      | `AttentionS2`, `NeighborhoodAttentionS2`, `DiscreteContinuousConvS2`, `DiscreteContinuousConvTransposeS2`, `QuadratureS2` |
+| `"healpix"`        | `th.HealpixGrid(nside=...)`                | `(npix,)`      | `RealSHT`, `InverseRealSHT`, `RealVectorSHT`, `InverseRealVectorSHT`, `SpectralConvS2`, `ResampleS2`, `AttentionS2`, `NeighborhoodAttentionS2`, `DiscreteContinuousConvS2`, `DiscreteContinuousConvTransposeS2`, `QuadratureS2`, `GaussianRandomFieldS2`; distributed: the four SHTs and `DistributedQuadratureS2`, polar ranks only |
+
+Equiangular and Fejér-1 grids use native quadrature at the default SHT
+truncation. Explicitly higher `lmax` bounds can use folded scalar and vector
+analysis, provided the latitude bound fits the grid and `mmax` excludes the
+even-longitude Nyquist order. See the [grid guide](docs/guide/grids.md) for
+the precise limits and memory costs.
 
 Layers that map between two grids take `grid_in` and `grid_out`, which need not
 be of the same type -- attention can decode from HEALPix onto a latitude-longitude
@@ -316,12 +324,22 @@ volume = th.QuadratureVolume(grid)(torch.ones(grid.shape))   # 4/3 pi (2^3 - 1^3
 The distributed layers take the *global* grid and derive each rank's shard from
 it. Passing a resolution where a descriptor belongs raises a `TypeError` naming
 the replacement, and a layer that does not support a grid yet refuses it at
-construction. See [Grids](https://nvidia.github.io/torch-harmonics/api/utilities.html#grids)
+construction.
+
+A HEALPix grid decomposes along latitude only: each polar rank holds a contiguous
+band of rings with about the same number of pixels, which in RING order is a
+contiguous slice of the flat pixel axis, so a local field is `(..., npix_local)`.
+The rings differ in length, so there is no global `nlon` to split, and a process
+grid with more than one azimuth rank is rejected with a `NotImplementedError` at
+construction. Of the distributed layers, `DistributedRealSHT`,
+`DistributedInverseRealSHT`, `DistributedRealVectorSHT`,
+`DistributedInverseRealVectorSHT` and `DistributedQuadratureS2` accept HEALPix so
+far. See [Grids](https://nvidia.github.io/torch-harmonics/api/utilities.html#grids)
 for the full descriptor API, and the [grid descriptors notebook](./notebooks/grid_descriptors.ipynb) for a walkthrough.
 
 ### Distributed and further reading
 
-To enable scalable model-parallelism, `torch-harmonics` implements a distributed variant of the SHT located in `torch_harmonics.distributed`.
+To enable scalable model-parallelism, `torch-harmonics` implements distributed variants of the SHT and the other layers in `torch_harmonics.distributed`. See the [distributed guide](docs/guide/distributed.md) for the process grid, how fields are split across ranks, and the HEALPix restrictions.
 
 Detailed usage of torch-harmonics, alongside helpful analysis provided in a series of notebooks:
 

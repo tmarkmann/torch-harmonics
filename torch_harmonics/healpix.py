@@ -40,10 +40,10 @@ no pixel carries more of the sphere than any other, so a per-pixel loss needs no
 area weighting and the poles are not oversampled the way they are on an
 equiangular grid.
 
-The isolatitude property is what makes it expressible here at all. Everything in
-this library that is not a spherical harmonic transform -- the DISCO convolutions,
-neighborhood attention, the quadrature -- needs only that the points be organized
-into rings of constant colatitude, which is exactly what
+The isolatitude property is what makes it expressible here at all. The DISCO
+convolutions, neighborhood attention, the quadrature and the spherical harmonic
+transforms need only that the points be organized into rings of constant
+colatitude, which is exactly what
 :attr:`~torch_harmonics.grid.GridS2.nlon_per_lat` and
 :attr:`~torch_harmonics.grid.GridS2.lon_offsets` describe. What HEALPix does not
 give is a *rectangular* ring structure: ring sizes grow from 4 at the pole to
@@ -77,15 +77,16 @@ References
 """
 
 import numbers
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Tuple
 
 import torch
 
 from torch_harmonics.cache import lru_cache
-from torch_harmonics.grid import GridS2, _as_int
+from torch_harmonics.grid import GridS2, GridShardS2, _as_int
 
-__all__ = ["HealpixGrid", "healpix_ring_structure"]
+__all__ = ["HealpixGrid", "HealpixGridShardS2", "healpix_ring_structure", "healpix_ring_weights"]
 
 
 @lru_cache(typed=True, copy=True)
@@ -166,6 +167,92 @@ def healpix_ring_structure(nside: int) -> Tuple[torch.Tensor, torch.Tensor, torc
     return nlon_per_lat, lon_shifts, colats
 
 
+@lru_cache(typed=True, copy=True)
+def healpix_ring_weights(nside: int) -> torch.Tensor:
+    r"""
+    Latitudinal analysis weights of the HEALPix SHT, one per ring.
+
+    No quadrature on HEALPix is exact for spherical harmonics, so its analysis is
+    approximate whichever weights it uses. These *ring weights* are the smallest
+    correction to the equal-area weights :math:`4\pi / N_{pix}` per pixel that integrates
+    every zonal harmonic :math:`P_l(\cos\theta)` of degree :math:`l < 3 N` exactly:
+
+    .. math::
+
+        \min_v \lVert v - u \rVert_2
+        \quad \text{subject to} \quad
+        \sum_k n_k\, v_k\, P_l(z_k) = 4\pi\, \delta_{l0}, \quad l < 3N,
+
+    with :math:`v_k` the weight of a pixel on ring :math:`k`, :math:`n_k` its ring size,
+    :math:`z_k = \cos\theta_k` and :math:`u` the equal-area weight. The weights are
+    symmetric about the equator, so odd degrees hold automatically and only the
+    :math:`2N` northern rings are unknowns. The degree :math:`3N` is chosen for
+    conditioning: the constraint matrix then has a condition number of about
+    :math:`2N`, and the weights stay within a few percent of :math:`u` at every
+    resolution (between :math:`-3\%` and :math:`+14\%`). Requiring exactness up to
+    :math:`4N`, which the ring count would allow, is ill-conditioned beyond
+    :math:`N \approx 16`.
+
+    The resulting analysis error matches that of the precomputed ring weights HEALPix
+    and healpy ship for ``use_weights=True`` [1]_. They improve the zonal coefficients
+    by orders of magnitude but the others only modestly: most of the analysis error of a
+    band-limited field comes from orders :math:`m > 0`, which no choice of ring weights
+    corrects. Jacobi iteration, ``RealSHT(..., iter=k)``, removes it.
+
+    Parameters
+    ----------
+    nside : int
+        Resolution parameter :math:`N`, at least 1.
+
+    Returns
+    -------
+    torch.Tensor
+        Weights in the :math:`\cos\theta` domain, like
+        :attr:`~torch_harmonics.grid.GridS2.colat_weights`: ``float64``, shape
+        ``(4 * nside - 1,)``, summing to 2. Ring :math:`k` carries
+        :math:`w_k = n_k v_k / (2\pi)`.
+
+    References
+    ----------
+    .. [1] Gorski K. M., et al.; HEALPix: A Framework for High-Resolution
+        Discretization and Fast Analysis of Data Distributed on the Sphere;
+        ApJ 622:759, 2005.
+    """
+    if nside < 1:
+        raise ValueError(f"nside must be at least 1, got {nside}")
+
+    nlon_per_lat, _, colats = healpix_ring_structure(nside)
+    npix = 12 * nside * nside
+
+    # the 2N northern rings, the last of them the equator; every other one has a mirror
+    nnorth = 2 * nside
+    z = torch.cos(colats[:nnorth])
+    multiplicity = nlon_per_lat[:nnorth].to(torch.float64) * 2.0
+    multiplicity[-1] /= 2.0
+
+    # P_l(z) for l < 3N by the three-term recurrence, keeping the even degrees
+    ldegree = 3 * nside
+    rows = []
+    p_prev, p = torch.ones_like(z), z.clone()
+    rows.append(p_prev)
+    for l in range(1, ldegree - 1):
+        p_prev, p = p, ((2 * l + 1) * z * p - l * p_prev) / (l + 1)
+        if (l + 1) % 2 == 0:
+            rows.append(p)
+    A = torch.stack(rows) * multiplicity
+
+    b = torch.zeros(A.shape[0], dtype=torch.float64)
+    b[0] = 4.0 * torch.pi
+    u = torch.full((nnorth,), 4.0 * torch.pi / npix, dtype=torch.float64)
+
+    # minimum-norm correction, v = u + A^T (A A^T)^{-1} (b - A u)
+    gram = A @ A.T
+    v = u + A.T @ torch.linalg.solve(gram, b - A @ u)
+
+    pixel_weights = torch.cat([v, v[:-1].flip(0)])
+    return nlon_per_lat.to(torch.float64) * pixel_weights / (2.0 * torch.pi)
+
+
 @dataclass(frozen=True, eq=False)
 class HealpixGrid(GridS2):
     r"""
@@ -183,11 +270,14 @@ class HealpixGrid(GridS2):
 
     Notes
     -----
-    Not suitable for a spherical harmonic transform: the equal-area quadrature
-    integrates only constants exactly, so :func:`~torch_harmonics.truncate_sht`
-    refuses this grid. It is supported by :class:`~torch_harmonics.AttentionS2`,
-    :class:`~torch_harmonics.NeighborhoodAttentionS2` and
-    :class:`~torch_harmonics.QuadratureS2`; the DISCO convolutions do not accept it yet.
+    :class:`~torch_harmonics.RealSHT`, :class:`~torch_harmonics.InverseRealSHT`,
+    :class:`~torch_harmonics.RealVectorSHT` and :class:`~torch_harmonics.InverseRealVectorSHT`
+    accept this grid. Synthesis is exact; analysis is approximate, since no quadrature on
+    HEALPix makes the spherical harmonics discretely orthogonal. It uses
+    :func:`healpix_ring_weights` and can be refined by Jacobi iteration, see
+    :class:`~torch_harmonics.RealSHT`. The default truncation is ``lmax = mmax = 2 *
+    nside``, and a forward transform accepts up to ``3 * nside``
+    (:attr:`max_recoverable_degree`).
 
     Examples
     --------
@@ -363,17 +453,82 @@ class HealpixGrid(GridS2):
         raise NotImplementedError(
             "HEALPix has no exact quadrature degree: its equal-area rule integrates a constant exactly and "
             "nothing beyond, so the associated Legendre functions are not discretely orthogonal under it. "
-            "Use HEALPix for the localized operators and quadrature, and a Gauss or equiangular grid for an SHT."
+            "Its SHT analysis is approximate; see default_sht_degree and max_recoverable_degree for its bounds."
         )
+
+    @property
+    def default_sht_degree(self) -> int:
+        r"""
+        Default ``lmax`` of an SHT on this grid, :math:`2 N`.
+
+        Non-inclusive. Below it, the analysis is well conditioned: with
+        :func:`healpix_ring_weights` a band-limited field is recovered to a relative
+        error of about :math:`10^{-2}` without iteration and :math:`10^{-6}` with three
+        Jacobi iterations.
+        """
+        return 2 * self.nside
+
+    @property
+    def max_azimuthal_order(self) -> int:
+        r"""
+        Largest order an SHT on this grid accepts, :math:`3 N`, non-inclusive.
+
+        Orders at or above half a ring's length alias on that ring; the belt rings resolve
+        :math:`m < 2N` directly and the polar rings fewer. Orders up to
+        :math:`3N` are still determined by the rings jointly, the same bound as
+        :attr:`max_recoverable_degree`.
+        """
+        return 3 * self.nside
+
+    @property
+    def max_recoverable_degree(self) -> int:
+        r"""
+        Largest ``lmax`` a forward SHT accepts on this grid, :math:`3 N`, non-inclusive.
+
+        The usual HEALPix bound :math:`l \le 3N - 1`. Beyond it the
+        :math:`12 N^2` pixels no longer determine the coefficients. Accuracy degrades well
+        before it: see :attr:`default_sht_degree`.
+        """
+        return 3 * self.nside
 
     # -- decomposition -------------------------------------------------------
 
-    def shard(self, polar: Optional[Tuple[int, int]] = (0, 1), azimuth: Optional[Tuple[int, int]] = (0, 1)) -> "GridS2":
-        raise NotImplementedError(
-            "HEALPix does not decompose as a product of a latitude range and a longitude range: rings differ "
-            "in length, so there is no global nlon to split azimuthally. A ragged decomposition should split "
-            "the flat pixel range, which GridShardS2 does not yet describe."
-        )
+    @classmethod
+    def shard_class(cls) -> type:
+        return HealpixGridShardS2
+
+    def shard(self, polar: Tuple[int, int] = (0, 1), azimuth: Tuple[int, int] = (0, 1)) -> "HealpixGridShardS2":
+        """
+        Return the piece of this grid held by one rank of a latitude decomposition.
+
+        The rings are split into contiguous bands of about equal pixel count, see
+        :class:`HealpixGridShardS2`. There is no azimuthal split: rings differ in length
+        and carry different phases, so there is no global ``nlon`` to divide.
+
+        Parameters
+        ----------
+        polar : tuple of int, optional
+            ``(rank, size)`` along latitude, by default ``(0, 1)``.
+        azimuth : tuple of int, optional
+            ``(rank, size)`` along longitude. Only ``size == 1`` is supported; it is accepted so
+            that code written for a :class:`~torch_harmonics.grid.RegularGridS2` decomposition,
+            which passes both, runs unchanged on a one-dimensional communicator layout.
+
+        Returns
+        -------
+        HealpixGridShardS2
+            The local piece, which knows the global grid it came from.
+
+        Raises
+        ------
+        NotImplementedError
+            If ``azimuth`` splits the rings.
+        """
+        if tuple(azimuth)[1] != 1:
+            raise NotImplementedError(
+                f"HEALPix decomposes along latitude only; got an azimuthal split of size {azimuth[1]}. Rings differ in length, so there is no global nlon to divide."
+            )
+        return HealpixGridShardS2(grid=self, polar_rank=polar[0], polar_size=polar[1])
 
     # -- construction --------------------------------------------------------
 
@@ -394,3 +549,156 @@ class HealpixGrid(GridS2):
         if level < 0:
             raise ValueError(f"level must be non-negative, got {level}")
         return cls(nside=1 << level)
+
+
+@lru_cache(typed=True)
+def _ring_cuts(nside: int, size: int) -> Tuple[int, ...]:
+    """
+    Ring indices at which a ``size``-way latitude split of a HEALPix grid cuts, ``size + 1`` of them.
+
+    Rank ``r`` owns the rings ``cuts[r]:cuts[r + 1]``. Each cut is the ring boundary nearest the
+    point where the cumulative pixel count reaches ``r / size`` of the total, so every rank holds
+    the same number of pixels up to half a ring, at most ``2 * nside``. Every rank holds at least one ring.
+    """
+    offsets = HealpixGrid(nside=nside).lon_offsets.tolist()
+    nrings = len(offsets) - 1
+    cuts = [0]
+    for rank in range(1, size):
+        target = offsets[-1] * rank / size
+        above = bisect_left(offsets, target)
+        below = max(above - 1, 0)
+        cut = below if target - offsets[below] <= offsets[above] - target else above
+        # at least one ring for this rank, and for each of the ranks after it
+        cuts.append(min(max(cut, cuts[-1] + 1), nrings - (size - rank)))
+    cuts.append(nrings)
+    return tuple(cuts)
+
+
+@dataclass(frozen=True, eq=False)
+class HealpixGridShardS2(GridShardS2):
+    r"""
+    One rank's piece of a :class:`HealpixGrid` under a latitude decomposition.
+
+    The local piece is a contiguous band of rings, which in RING order is a contiguous slice
+    of the flat pixel axis, so a local field is ``(..., npoints)``. The bands are cut so that
+    every rank holds about the same number of **pixels**, not rings: rings grow from 4 pixels
+    at the poles to :math:`4 N` at the equator, and equal ring counts would leave a polar rank
+    with a fraction of an equatorial rank's pixels. Polar ranks therefore hold more, shorter rings.
+
+    Parameters
+    ----------
+    grid : HealpixGrid
+        The global grid this is a piece of.
+    polar_rank, polar_size : int
+        Position and extent of the decomposition along latitude. ``polar_size`` cannot exceed
+        the number of rings.
+    """
+
+    polar_rank: int = 0
+    polar_size: int = 1
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not isinstance(self.grid, HealpixGrid):
+            raise ValueError(f"grid must be a HealpixGrid, got {type(self.grid).__name__}")
+        for field in ("polar_rank", "polar_size"):
+            _as_int(self, field)
+        if self.polar_size < 1:
+            raise ValueError(f"polar_size must be at least 1, got {self.polar_size}")
+        if not 0 <= self.polar_rank < self.polar_size:
+            raise ValueError(f"polar_rank must lie in [0, {self.polar_size}), got {self.polar_rank}")
+        if self.polar_size > self.grid.nrings:
+            raise ValueError(f"cannot split {self.grid.nrings} rings over {self.polar_size} ranks")
+
+    def __repr__(self) -> str:
+        return f"HealpixGridShardS2({self.grid!r}, polar={self.polar_rank}/{self.polar_size})"
+
+    # -- local extent --------------------------------------------------------
+
+    @property
+    def ring_cuts(self) -> Tuple[int, ...]:
+        """Ring indices bounding every rank's band, ``polar_size + 1`` of them."""
+        return _ring_cuts(self.grid.nside, self.polar_size)
+
+    @property
+    def ring_shapes(self) -> Tuple[int, ...]:
+        """Ring counts held by every polar rank, ordered by rank."""
+        cuts = self.ring_cuts
+        return tuple(b - a for a, b in zip(cuts, cuts[1:]))
+
+    @property
+    def pixel_shapes(self) -> Tuple[int, ...]:
+        """Pixel counts held by every polar rank, ordered by rank; the sizes to split a flat field by."""
+        offsets = self.grid.lon_offsets.tolist()
+        cuts = self.ring_cuts
+        return tuple(offsets[b] - offsets[a] for a, b in zip(cuts, cuts[1:]))
+
+    @property
+    def nrings(self) -> int:
+        """Number of rings on this rank."""
+        return self.ring_shapes[self.polar_rank]
+
+    @property
+    def ring_offset(self) -> int:
+        """Index of this rank's first ring within the global grid."""
+        return self.ring_cuts[self.polar_rank]
+
+    @property
+    def npoints(self) -> int:
+        """Number of pixels on this rank."""
+        return self.pixel_shapes[self.polar_rank]
+
+    @property
+    def pixel_offset(self) -> int:
+        """Index of this rank's first pixel within the global flat field."""
+        return int(self.grid.lon_offsets[self.ring_offset])
+
+    @property
+    def shape(self) -> Tuple[int]:
+        """Local field shape ``(npoints,)``."""
+        return (self.npoints,)
+
+    # -- local geometry ------------------------------------------------------
+
+    @property
+    def colats(self) -> torch.Tensor:
+        """This rank's slice of the global ring colatitudes, shape ``(nrings,)``."""
+        return self.grid.colats[self.ring_offset : self.ring_offset + self.nrings]
+
+    @property
+    def lats(self) -> torch.Tensor:
+        r"""This rank's slice of the global ring latitudes :math:`\pi/2 - \theta`, shape ``(nrings,)``."""
+        return torch.pi / 2 - self.colats
+
+    @property
+    def nlon_per_lat(self) -> torch.Tensor:
+        """Pixels in each of this rank's rings, shape ``(nrings,)``."""
+        return self.grid.nlon_per_lat[self.ring_offset : self.ring_offset + self.nrings]
+
+    @property
+    def quad_weights(self) -> torch.Tensor:
+        r"""
+        This rank's per-pixel solid-angle weights, shape ``(npoints,)``.
+
+        Sums to :math:`4\pi` only across all ranks.
+        """
+        # built from this rank's rings alone: slicing the global weights would keep the whole
+        # 12 nside^2 tensor alive on every rank. The same per-ring factor as the grid's, so the
+        # values are bitwise those of the global weights
+        counts = self.nlon_per_lat
+        weights = self.grid.colat_weights[self.ring_offset : self.ring_offset + self.nrings]
+        per_point = weights * (2.0 * torch.pi / counts.to(weights.dtype))
+        return torch.repeat_interleave(per_point, counts)
+
+    def lons(self, ilat: int) -> torch.Tensor:
+        """
+        Longitudes of the pixels of this rank's ``ilat``-th ring, counted from the end if negative.
+
+        Raises
+        ------
+        ValueError
+            If ``ilat`` is outside this rank's rings.
+        """
+        if not -self.nrings <= ilat < self.nrings:
+            raise ValueError(f"ilat must be in [0, {self.nrings}), got {ilat}")
+        return self.grid.lons(self.ring_offset + ilat % self.nrings)

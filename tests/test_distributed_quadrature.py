@@ -33,13 +33,18 @@ import unittest
 
 import torch
 from parameterized import parameterized
-from testutils import compare_tensors, gather_tensor_hw, reduce_success, set_seed, setup_class_from_context, setup_module, split_tensor_hw, teardown_module
+from testutils import compare_tensors, gather_tensor_hw, range_atol, reduce_success, set_seed, setup_class_from_context, setup_module, split_tensor_hw, teardown_module
 
 import torch_harmonics as th
 import torch_harmonics.distributed as thd
 
 # shared state
 _DIST_CTX = {}
+
+# Error budget in ULPs of the integral of |f| (see testutils.range_atol): the distributed
+# integral reassociates the float32 grid sum across ranks.
+# Measured: 0.06 ULPs of int |f|.
+_QUAD_ULPS = 8
 
 
 def setUpModule():
@@ -80,13 +85,13 @@ class TestDistributedQuadrature(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [64, 128, 4, 3, "equiangular", False, 1e-7, 1e-5],
-            [65, 128, 2, 2, "equiangular", True, 1e-7, 1e-5],
-            [64, 128, 4, 3, "legendre-gauss", False, 1e-7, 1e-5],
-            [65, 128, 2, 2, "lobatto", False, 1e-7, 1e-5],
+            [64, 128, 4, 3, "equiangular", False],
+            [65, 128, 2, 2, "equiangular", True],
+            [64, 128, 4, 3, "legendre-gauss", False],
+            [65, 128, 2, 2, "lobatto", False],
         ]
     )
-    def test_distributed_quadrature(self, nlat, nlon, batch_size, num_chan, grid, normalize, atol, rtol, verbose=False):
+    def test_distributed_quadrature(self, nlat, nlon, batch_size, num_chan, grid, normalize, verbose=False):
 
         set_seed(333)
 
@@ -125,14 +130,86 @@ class TestDistributedQuadrature(unittest.TestCase):
         verbose = verbose and self.world_rank == 0
 
         # evaluate FWD pass
-        ok = compare_tensors("output", out_full, out_local, atol=atol, rtol=rtol, verbose=verbose)
+        # the integral of random data cancels, so the floor comes from the summed terms, int |f|
+        with torch.no_grad():
+            atol = range_atol(quad_local(inp_full.detach().abs()), 0.0, _QUAD_ULPS)
+        ok = compare_tensors("output", out_local, out_full, atol=atol, rtol=0.0, verbose=verbose)
         self.assertTrue(reduce_success(ok, self.device), "output")
 
         # evaluate BWD pass
         igrad_gather_full = self._gather_helper(igrad_local, quad_dist)
-        ok = compare_tensors("gradients", igrad_full, igrad_gather_full, atol=atol, rtol=rtol, verbose=verbose)
+        # the gradient is the upstream gradient times the weights, elementwise: exact
+        ok = compare_tensors("gradients", igrad_gather_full, igrad_full, atol=0.0, rtol=0.0, verbose=verbose)
         self.assertTrue(reduce_success(ok, self.device), "gradients")
 
+    @parameterized.expand(
+        [
+            [8, 4, 3, False],
+            [8, 2, 2, True],
+            [16, 2, 3, False],
+        ]
+    )
+    def test_distributed_quadrature_healpix(self, nside, batch_size, num_chan, normalize, verbose=False):
+        """A HEALPix field is a flat pixel axis split into bands of rings along the polar group."""
+        if self.grid_size_w > 1:
+            self.skipTest("HEALPix decomposes along latitude only")
 
-if __name__ == "__main__":
-    unittest.main()
+        set_seed(333)
+
+        B, C = batch_size, num_chan
+        grid = th.HealpixGrid(nside=nside)
+        quad_local = th.QuadratureS2(grid, normalize=normalize).to(self.device)
+        quad_dist = thd.DistributedQuadratureS2(grid, normalize=normalize).to(self.device)
+
+        inp_full = torch.randn((B, C, grid.npoints), dtype=torch.float32, device=self.device)
+
+        # serial quadrature
+        inp_full.requires_grad = True
+        out_full = quad_local(inp_full)
+        with torch.no_grad():
+            ograd_full = torch.randn_like(out_full)
+        out_full.backward(ograd_full)
+        igrad_full = inp_full.grad.clone()
+
+        # distributed quadrature: the shard knows how many pixels every rank holds
+        pixel_shapes = quad_dist.pixel_shapes
+        self.assertEqual(sum(pixel_shapes), grid.npoints)
+        inp_local = torch.split(inp_full.detach().clone(), pixel_shapes, dim=-1)[self.hrank].contiguous()
+        self.assertEqual(inp_local.shape[-1], quad_dist.shard.npoints)
+        inp_local.requires_grad = True
+        out_local = quad_dist(inp_local)
+        out_local.backward(ograd_full.clone())
+        igrad_local = inp_local.grad.clone()
+
+        # only the spatial axis is reduced: a single field integrates to a scalar
+        self.assertEqual(quad_dist(inp_local[0, 0].detach()).shape, torch.Size([]))
+
+        verbose = verbose and self.world_rank == 0
+
+        with torch.no_grad():
+            atol = range_atol(quad_local(inp_full.detach().abs()), 0.0, _QUAD_ULPS)
+        ok = compare_tensors("output", out_local, out_full, atol=atol, rtol=0.0, verbose=verbose)
+        self.assertTrue(reduce_success(ok, self.device), "output")
+
+        igrad_gather_full = gather_tensor_hw(
+            igrad_local,
+            hdim=-1,
+            wdim=-1,
+            hshapes=pixel_shapes,
+            wshapes=[],
+            hsize=self.grid_size_h,
+            wsize=1,
+            hrank=self.hrank,
+            wrank=self.wrank,
+            hgroup=self.h_group,
+            wgroup=self.w_group,
+        )
+        ok = compare_tensors("gradients", igrad_gather_full, igrad_full, atol=0.0, rtol=0.0, verbose=verbose)
+        self.assertTrue(reduce_success(ok, self.device), "gradients")
+
+    def test_a_healpix_grid_refuses_an_azimuthal_decomposition(self):
+        """With azimuth ranks the rings would be cut mid-ring; the layer says so at construction."""
+        if self.grid_size_w == 1:
+            self.skipTest("needs an azimuth group of more than one rank")
+        with self.assertRaises(NotImplementedError):
+            thd.DistributedQuadratureS2(th.HealpixGrid(nside=8))
