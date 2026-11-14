@@ -29,6 +29,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
+import dataclasses
 import math
 import unittest
 
@@ -303,6 +304,76 @@ class TestRadialPoissonSolver(unittest.TestCase):
         self.assertEqual(source[outside].abs().max().item(), 0.0)
         self.assertGreater(source[~outside].abs().max().item(), 0.0)
 
+    @parameterized.expand([[None], [2.0]])
+    def test_target_grid_is_the_fine_solve_at_its_nodes(self, inner_radius, verbose=False):
+        """
+        On a target grid nested in the source grid, the solve is the full one at the target nodes.
+
+        Every 4th node of the fine geometric grid is a node of the coarse one, so the rows of
+        the Green's kernel for the coarse nodes are those of the fine kernel.
+        """
+        fine = make_solver(129, rmin=1e-2, inner_radius=inner_radius, device=self.device)
+        coarse = dataclasses.replace(fine.grid.radial, nr=33)
+        solver = RadialPoissonSolver(fine.grid, radial_out=coarse).to(self.device)
+
+        source = fine.random_bump_source(nblobs=4, dtype=torch.float64).unsqueeze(0)
+        out = solver.solve(source).squeeze(0)
+        expected = fine.solve(source).squeeze(0)[::4]
+
+        self.assertEqual(tuple(out.shape), (33, fine.nlat, fine.nlon))
+        self.assertTrue(torch.allclose(solver.r_out, fine.r[::4], rtol=1e-14, atol=0.0))
+        self.assertTrue(compare_tensors("solve on the nested target grid", out, expected, atol=0.0, rtol=0.0, ulps=_PRECISION_ULPS, eps_dtype=torch.float64, verbose=verbose))
+
+    def test_target_grid_solves_a_known_solution(self):
+        """
+        On a target grid that shares no nodes with the source grid, the solve reproduces a
+        known smooth solution to the accuracy of the source grid's quadrature.
+        """
+        fine = make_solver(1024, device=self.device)
+        target = GeometricRadialGrid(100, 0.15, 7.0)
+        solver = RadialPoissonSolver(fine.grid, radial_out=target).to(self.device)
+
+        _, source = gaussian_shell(fine.r)
+        expected, _ = gaussian_shell(solver.r_out)
+        field = source.reshape(-1, 1, 1).expand(fine.nr, fine.nlat, fine.nlon).contiguous()
+        actual = solver.solve(field.unsqueeze(0)).squeeze(0)[:, 0, 0]
+
+        window = (solver.r_out > 0.2) & (solver.r_out < 5.0)
+        error = relative_error(actual[window], expected[window])
+        self.assertLess(error, 1e-3, f"relative error {error:.3e} on the target grid")
+
+    @parameterized.expand([["other_inner_radius", 2.0, 1.0], ["half_line_target", 2.0, 0.0], ["exterior_target", None, 1.0]])
+    def test_target_grid_on_another_domain_is_refused(self, _, inner_radius, target_inner):
+        """The Green's kernel is that of the source grid's domain, so the target grid must cover the same one."""
+        grid = make_solver(64, rmin=1e-1, inner_radius=inner_radius).grid
+        target = GeometricRadialGrid(32, target_inner + 0.5, 100.0, r_inner=target_inner)
+        with self.assertRaisesRegex(ValueError, "radial_out"):
+            RadialPoissonSolver(grid, radial_out=target)
+
+    @parameterized.expand([[None], [2.0]])
+    def test_bump_source_stays_inside_its_support(self, inner_radius):
+        """
+        With a support, no bump reaches outside it, on either domain.
+
+        On the exterior domain the support is mapped to the solver's x = log(r - R), not to
+        log(r), so blobs placed in log(r) would land outside it.
+        """
+        solver = make_solver(64, rmin=1e-1, inner_radius=inner_radius, device=self.device)
+        lo, hi = solver.r[16].item(), solver.r[40].item()
+        source = solver.random_bump_source(nblobs=32, support=(lo, hi), dtype=torch.float64)
+
+        outside = (solver.r < lo) | (solver.r > hi)
+        self.assertTrue(outside.any())
+        self.assertEqual(source[outside].abs().max().item(), 0.0)
+        self.assertGreater(source[~outside].abs().max().item(), 0.0)
+
+    @parameterized.expand([[(1e-2, 1.0)], [(1.0, 1e4)], [(10.0, 1.0)]])
+    def test_bump_support_outside_the_grid_is_refused(self, support):
+        """A support reaching past the grid's nodes, or an empty one, is refused rather than clipped."""
+        solver = make_solver(64, rmin=1e-1, device=self.device)
+        with self.assertRaisesRegex(ValueError, "support"):
+            solver.random_bump_source(support=support)
+
     @parameterized.expand([["bump"], ["ball"]])
     def test_sources_come_in_the_requested_dtype(self, source):
         """
@@ -359,6 +430,57 @@ class TestRadialPoissonSolver(unittest.TestCase):
         grid = make_solver(64, rmin=1e-1).grid
         solver = RadialPoissonDataset(grid, num_examples=1, device=self.device).solver
         self.assertEqual({b.dtype for b in solver.buffers() if b.is_floating_point()}, {torch.float64})
+
+    @parameterized.expand([["bump"], ["ball"]])
+    def test_oversampled_dataset_samples_solve_the_equation(self, source, verbose=False):
+        """
+        Oversampled, a pair is the source drawn and solved on the fine grid, both taken at the nodes of the grid.
+
+        The same draw, solved in float64 on the fine grid alone and taken at every
+        oversampling-th node, gives the target, to the float32 the dataset solves in.
+        """
+        k = 4
+        grid = make_solver(33, rmin=1e-1).grid
+        dataset = RadialPoissonDataset(grid, source=source, num_examples=1, device=self.device, normalize=False, oversampling=k)
+        self.assertEqual(dataset.solver.nr, k * 32 + 1)
+
+        set_seed(333)
+        inp, tar = dataset[0]
+        set_seed(333)
+        f = dataset._get_source(torch.float32)
+        self.assertEqual((tuple(inp.shape), tuple(tar.shape)), ((33, 16, 32), (33, 16, 32)))
+
+        reference = RadialPoissonSolver(dataset.solver.grid).to(self.device)
+        expected = reference.solve(f.double().unsqueeze(0)).squeeze(0)[::k]
+        r = dataset.solver.r_out.reshape(-1, 1, 1)
+        self.assertTrue(torch.equal(inp, (r.float() ** 2 * f[::k])))
+        self.assertTrue(compare_tensors(f"oversampled {source} target", tar.double(), expected, atol=0.0, rtol=0.0, ulps=_PRECISION_ULPS, eps_dtype=torch.float32, verbose=verbose))
+
+    def test_oversampling_needs_a_geometric_grid(self):
+        """Only a geometric grid has a refinement that contains its nodes, so oversampling anything else is refused."""
+        grid = SphericalProductGrid(as_grid("legendre-gauss", nlat=16, nlon=32), LegendreGaussRadialGrid(16, 0.0, 1.0))
+        with self.assertRaisesRegex(ValueError, "GeometricRadialGrid"):
+            RadialPoissonDataset(grid, oversampling=2)
+        with self.assertRaisesRegex(ValueError, "oversampling"):
+            RadialPoissonDataset(make_solver(64, rmin=1e-1).grid, oversampling=0)
+
+    @parameterized.expand([[1], [2]])
+    def test_dataset_ball_radius_lies_in_its_support(self, oversampling):
+        """With a support, every ball's radius is a node of the grid inside it, and a support without nodes is refused."""
+        grid = make_solver(33, rmin=1e-1).grid
+        support = (1.0, 10.0)
+        dataset = RadialPoissonDataset(grid, source="ball", num_examples=1, device=self.device, normalize=False, support=support, oversampling=oversampling)
+        r = dataset.solver.r_out
+
+        for _ in range(16):
+            inp, _ = dataset[0]
+            # the ball is the nodes with a nonzero input, out to its radius
+            radius = r[inp[:, 0, 0] != 0].max().item()
+            self.assertTrue(support[0] <= radius <= support[1], f"ball radius {radius} outside {support}")
+
+        with self.assertRaisesRegex(ValueError, "support"):
+            # between the nodes 1.0 and 1.33 of the grid
+            RadialPoissonDataset(grid, source="ball", support=(1.05, 1.1))
 
     def test_move_to_a_device_without_float64(self):
         """

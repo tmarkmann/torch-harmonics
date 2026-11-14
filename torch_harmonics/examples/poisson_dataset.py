@@ -30,9 +30,12 @@
 #
 
 
+import dataclasses
+
 import torch
 
 from torch_harmonics.integration import QuadratureS2
+from torch_harmonics.radial import GeometricRadialGrid, SphericalProductGrid
 
 from .poisson_equation import RadialPoissonSolver
 
@@ -53,6 +56,15 @@ class RadialPoissonDataset(torch.utils.data.Dataset):
         Device to use, by default torch.device("cpu")
     normalize : bool, optional
         Whether to normalize the input and target, by default True
+    support : tuple, optional
+        Interval ``(lo, hi)`` of radii that confines the "bump" blobs and the "ball" radius,
+        by default None, which keeps the blobs off the ends of the grid and draws the ball
+        radius from the middle of it
+    oversampling : int, optional
+        Radial refinement of the grid the sources are drawn and solved on, by default 1.
+        Above 1, ``grid.radial`` must be a GeometricRadialGrid; the sources then live on the
+        geometric grid with ``oversampling * (nr - 1) + 1`` nodes, which contains the nodes
+        of ``grid`` as every ``oversampling``-th one
 
     Returns
     -------
@@ -72,20 +84,43 @@ class RadialPoissonDataset(torch.utils.data.Dataset):
         num_examples=32,
         device=torch.device("cpu"),
         normalize=True,
+        support=None,
+        oversampling=1,
     ):
-        if source not in ("bump", "ball"):
+        if source not in self._sources():
             raise ValueError(f"unknown source: {source}")
+        if not isinstance(oversampling, int) or oversampling < 1:
+            raise ValueError(f"oversampling must be a positive integer, got {oversampling!r}")
 
         self.num_examples = num_examples
         self.device = device
         self.normalize = normalize
         self.source = source
+        self.support = None if support is None else tuple(support)
+        self.oversampling = oversampling
 
-        # the solver keeps its buffers in float64 and solves in the precision of the source
-        self.solver = RadialPoissonSolver(grid).to(self.device)
-
-        self.grid = self.solver.grid
+        self.grid = grid
         self.nr, self.nlat, self.nlon = self.grid.shape
+
+        # the solver keeps its buffers in float64 and solves in the precision of the source.
+        # Oversampled, it draws and solves the sources on the fine grid and returns the
+        # solution on the nodes of grid
+        if oversampling == 1:
+            self.solver = RadialPoissonSolver(grid).to(self.device)
+        else:
+            if not isinstance(grid, SphericalProductGrid) or not isinstance(grid.radial, GeometricRadialGrid):
+                raise ValueError(f"oversampling needs a SphericalProductGrid with a GeometricRadialGrid, got {grid!r}")
+            fine = dataclasses.replace(grid.radial, nr=oversampling * (self.nr - 1) + 1)
+            self.solver = RadialPoissonSolver(SphericalProductGrid(grid.angular, fine), radial_out=grid.radial).to(self.device)
+
+        # nodes of the target grid the ball radius is drawn from, as indices into it
+        if self.support is None:
+            self.ball_nodes = torch.arange(self.nr // 5, 4 * self.nr // 5)
+        else:
+            r = self.solver.r_out
+            self.ball_nodes = torch.nonzero((r >= self.support[0]) & (r <= self.support[1])).flatten().cpu()
+            if source == "ball" and self.ball_nodes.numel() == 0:
+                raise ValueError(f"support {self.support} contains no radial node to draw a ball radius from")
 
         # mean over the sphere, on every radial node alike, for the scale
         self.sphere_mean = QuadratureS2(self.grid, normalize=True).to(self.device)
@@ -93,24 +128,33 @@ class RadialPoissonDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.num_examples
 
+    @classmethod
+    def _sources(cls):
+        """Source types _get_source draws; a subclass adding one extends both."""
+        return ("bump", "ball")
+
+    def _get_source(self, dtype):
+        """Draw one source f on the solver's grid, in dtype."""
+
+        if self.source == "bump":
+            nblobs = int(torch.randint(1, 9, ()).item())
+            return self.solver.random_bump_source(nblobs=nblobs, l_src=8, dtype=dtype, support=self.support)
+
+        # random target node, taken from the solver's grid, which contains it
+        ir = int(self.ball_nodes[torch.randint(self.ball_nodes.numel(), ())].item())
+        r = self.solver.r[self.oversampling * ir].item()
+        return self.solver.ball_source(radius=r, dtype=dtype)
+
     def _get_sample(self):
-        """Get one unscaled (r**2 f, u) pair in float32."""
+        """Get one unscaled (r**2 f, u) pair in float32, on the nodes of grid."""
 
         # the samples are float32, so they are solved in float32 too, which agrees with a
         # float64 solve to a few 1e-7 of the solution's maximum
         dtype = torch.float32
 
-        if self.source == "bump":
-            nblobs = int(torch.randint(1, 9, ()).item())
-            f = self.solver.random_bump_source(nblobs=nblobs, l_src=8, dtype=dtype)
-        else:
-            # random node in the middle of the grid
-            ir = int(torch.randint(self.nr // 5, 4 * self.nr // 5, ()).item())
-            r = self.solver.r[ir].item()
-            f = self.solver.ball_source(radius=r, dtype=dtype)
-
+        f = self._get_source(dtype)
         u = self.solver.solve(f)
-        r2f = self.solver.r.to(dtype).reshape(-1, 1, 1) ** 2 * f
+        r2f = self.solver.r_out.to(dtype).reshape(-1, 1, 1) ** 2 * f[:: self.oversampling]
 
         return r2f, u
 

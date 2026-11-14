@@ -31,6 +31,7 @@
 
 
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -53,6 +54,9 @@ class GreensOperator(nn.Module):
         nodes and volume weights r^2 dr discretize the radial integral
     lmax : int
         Number of spherical harmonic degrees
+    radial_out : RadialGrid, optional
+        Radial grid the solution is evaluated on, on the same domain as ``radial``, by
+        default ``radial``
 
     References
     ----------
@@ -61,17 +65,22 @@ class GreensOperator(nn.Module):
        https://farside.ph.utexas.edu/teaching/jk1/Electromagnetism/node31.html
     """
 
-    def __init__(self, radial: RadialGrid, lmax: int):
+    def __init__(self, radial: RadialGrid, lmax: int, radial_out: Optional[RadialGrid] = None):
         super().__init__()
 
         if radial.domain not in ("half-line", "exterior"):
             raise NotImplementedError(f"the Green's operator is implemented on the half-line and the exterior domain, got a {radial.domain} ({radial!r})")
 
+        if radial_out is None:
+            radial_out = radial
+        elif radial_out.domain != radial.domain or radial_out.r_inner != radial.r_inner:
+            raise ValueError(f"radial_out must cover the domain of radial, got {radial_out!r} for {radial!r}")
+
         self.lmax = lmax
         self.domain = radial.domain
         self.inner_radius = radial.r_inner if self.domain == "exterior" else None
 
-        green = self._assemble(torch.log(radial.r), radial.volume_weights)
+        green = self._assemble(torch.log(radial_out.r), torch.log(radial.r), radial.volume_weights)
 
         self.register_buffer("green", green)
 
@@ -80,11 +89,11 @@ class GreensOperator(nn.Module):
         recast_buffers_for(self, fn)
         return super()._apply(fn, recurse)
 
-    def _assemble(self, logr: torch.Tensor, quad: torch.Tensor) -> torch.Tensor:
-        """Green's kernel of shape (lmax, nr, nr), assembled in log space."""
+    def _assemble(self, logr_out: torch.Tensor, logr: torch.Tensor, quad: torch.Tensor) -> torch.Tensor:
+        """Green's kernel of shape (lmax, nr_out, nr), assembled in log space."""
 
-        # radial nodes broadcast against each other, shapes (nr, 1) and (1, nr)
-        logrk = logr.unsqueeze(-1)
+        # target and source nodes broadcast against each other, shapes (nr_out, 1) and (1, nr)
+        logrk = logr_out.unsqueeze(-1)
         logrj = logr.unsqueeze(0)
         loglo = torch.minimum(logrk, logrj)
         loghi = torch.maximum(logrk, logrj)
@@ -132,6 +141,10 @@ class RadialPoissonSolver(nn.Module):
         Maximum l mode, by default None
     mmax : int, optional
         Maximum m mode, by default None
+    radial_out : RadialGrid, optional
+        Radial grid ``solve`` returns the solution on, on the same domain as ``grid.radial``,
+        by default ``grid.radial``. Sources are still drawn and integrated on ``grid``, so a
+        finer ``grid`` resolves them better than the targets would
 
     Notes
     -----
@@ -151,7 +164,7 @@ class RadialPoissonSolver(nn.Module):
     # new in v1.0.0rc1, so there is no signature before the grid descriptors to reject
     _legacy_signature_exempt = "new in v1.0.0rc1"
 
-    def __init__(self, grid, lmax=None, mmax=None):
+    def __init__(self, grid, lmax=None, mmax=None, radial_out=None):
         super().__init__()
 
         if not isinstance(grid, SphericalProductGrid):
@@ -160,19 +173,23 @@ class RadialPoissonSolver(nn.Module):
 
         # grid parameters
         self.grid = grid
+        self.grid_out = grid if radial_out is None else SphericalProductGrid(grid.angular, radial_out)
         self.nr, self.nlat, self.nlon = grid.shape
+        self.nr_out = self.grid_out.radial.nr
         self.domain = grid.radial.domain
         self.inner_radius = grid.radial.r_inner if self.domain == "exterior" else None
 
-        # SHT, acting on every radial node alike
+        # SHT, acting on every radial node alike. The inverse on the target grid checks the
+        # radial axis of the solution, so it is a second transform if the grids differ
         self.sht = th.RealSHT(grid, lmax=lmax, mmax=mmax, csphase=False)
         self.isht = th.InverseRealSHT(grid, lmax=lmax, mmax=mmax, csphase=False)
+        self.isht_out = self.isht if radial_out is None else th.InverseRealSHT(self.grid_out, lmax=lmax, mmax=mmax, csphase=False)
 
         self.lmax = self.sht.lmax
         self.mmax = self.sht.mmax
 
         # exact radial Green's operator
-        self.operator = GreensOperator(grid.radial, self.lmax)
+        self.operator = GreensOperator(grid.radial, self.lmax, radial_out=self.grid_out.radial)
 
         # compute gridpoints. x is the coordinate the radial nodes are uniform in for a
         # geometric grid, log(r) on the half-line and log(r - R) on the exterior domain
@@ -188,6 +205,7 @@ class RadialPoissonSolver(nn.Module):
         self.register_buffer("x", x)
         self.register_buffer("r", r)
         self.register_buffer("w", w)
+        self.register_buffer("r_out", self.grid_out.radial.r)
 
     def _apply(self, fn, recurse=True):
         # float64 buffers cannot move to MPS; see recast_buffers_for
@@ -203,8 +221,8 @@ class RadialPoissonSolver(nn.Module):
         return self.isht(uspec)
 
     def solve(self, f: torch.Tensor) -> torch.Tensor:
-        """Solve poisson equation lap u = f on the grid."""
-        return self.spec2grid(self.operator(self.grid2spec(f)))
+        """Solve poisson equation lap u = f, for f on the grid and u on the target grid."""
+        return self.isht_out(self.operator(self.grid2spec(f)))
 
     def _random_angular_spec(self, shape, l_src=8) -> torch.Tensor:
         """Random band-limited complex coefficients of a real field on the sphere."""
@@ -229,13 +247,18 @@ class RadialPoissonSolver(nn.Module):
         f[self.r <= radius] = value
         return f
 
-    def random_bump_source(self, nblobs=4, l_src=8, margin=0.05, width=(0.03, 0.10), dtype=None) -> torch.Tensor:
+    def random_bump_source(self, nblobs=4, l_src=8, margin=0.05, width=(0.03, 0.10), dtype=None, support=None) -> torch.Tensor:
         """
         Random multi-scale source. A sum of nblobs terms, each a radial bump in x = log r times a random band-limited angular field.
 
         The source is generated in the precision of the solver's buffers and returned in
         `dtype`, by default the default dtype, so the same draw gives the same source in
         any precision, rounded.
+
+        The blobs lie in the radial range of the grid minus a `margin` at both ends, a
+        fraction of the log-radial range, or inside `support`, an interval ``(lo, hi)`` of
+        radii within the grid's nodes, which replaces the margins. `width` is a fraction of
+        the log-radial range of the grid in either case.
         """
 
         dtype = torch.get_default_dtype() if dtype is None else dtype
@@ -245,8 +268,17 @@ class RadialPoissonSolver(nn.Module):
         # range of source support
         x = self.x
         span = (x[-1] - x[0]).item()
-        xlo = x[0].item() + margin * span
-        xhi = x[-1].item() - margin * span
+        if support is None:
+            xlo = x[0].item() + margin * span
+            xhi = x[-1].item() - margin * span
+        else:
+            lo, hi = support
+            rlo, rhi = self.r[0].item(), self.r[-1].item()
+            if not rlo <= lo < hi <= rhi:
+                raise ValueError(f"support {tuple(support)} must be an interval inside the grid's nodes [{rlo:.6g}, {rhi:.6g}]")
+            # x is log(r - r_inner), as for the nodes
+            r_inner = self.grid.radial.r_inner
+            xlo, xhi = math.log(lo - r_inner), math.log(hi - r_inner)
 
         # every blob must contain a node, or a sample can vanish on the grid and normalizing
         # it divides by zero. A blob is an open interval in x at least 2 * min_half wide, so
