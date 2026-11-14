@@ -117,8 +117,9 @@ class RadialPoissonDataset(torch.utils.data.Dataset):
         if self.support is None:
             self.ball_nodes = torch.arange(self.nr // 5, 4 * self.nr // 5)
         else:
-            r = self.solver.r_out
-            self.ball_nodes = torch.nonzero((r >= self.support[0]) & (r <= self.support[1])).flatten().cpu()
+            # the nodes are computed, so one meant to sit on a bound of the support may miss it by a rounding
+            r, tol = self.solver.r_out, 1e-12
+            self.ball_nodes = torch.nonzero((r >= self.support[0] * (1 - tol)) & (r <= self.support[1] * (1 + tol))).flatten().cpu()
             if source == "ball" and self.ball_nodes.numel() == 0:
                 raise ValueError(f"support {self.support} contains no radial node to draw a ball radius from")
 

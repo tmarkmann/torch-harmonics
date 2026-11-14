@@ -274,11 +274,14 @@ class RadialPoissonSolver(nn.Module):
         else:
             lo, hi = support
             rlo, rhi = self.r[0].item(), self.r[-1].item()
-            if not rlo <= lo < hi <= rhi:
+            # the end nodes are computed, so a bound given as the grid's r_min or r_max may miss them by a rounding
+            tol = 1e-12
+            if not (rlo * (1 - tol) <= lo < hi <= rhi * (1 + tol)):
                 raise ValueError(f"support {tuple(support)} must be an interval inside the grid's nodes [{rlo:.6g}, {rhi:.6g}]")
             # x is log(r - r_inner), as for the nodes
             r_inner = self.grid.radial.r_inner
-            xlo, xhi = math.log(lo - r_inner), math.log(hi - r_inner)
+            xlo = max(math.log(max(lo, rlo) - r_inner), x[0].item())
+            xhi = min(math.log(min(hi, rhi) - r_inner), x[-1].item())
 
         # every blob must contain a node, or a sample can vanish on the grid and normalizing
         # it divides by zero. A blob is an open interval in x at least 2 * min_half wide, so

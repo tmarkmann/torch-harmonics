@@ -374,6 +374,14 @@ class TestRadialPoissonSolver(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "support"):
             solver.random_bump_source(support=support)
 
+    @parameterized.expand([[None], [2.0]])
+    def test_bump_support_may_be_the_grid_bounds(self, inner_radius):
+        """The grid's own r_min and r_max are a valid support, though the end nodes computed from them may miss them by a rounding."""
+        solver = make_solver(64, rmin=1e-1, inner_radius=inner_radius, device=self.device)
+        radial = solver.grid.radial
+        source = solver.random_bump_source(nblobs=8, support=(radial.r_min, radial.r_max), dtype=torch.float64)
+        self.assertGreater(source.abs().max().item(), 0.0)
+
     @parameterized.expand([["bump"], ["ball"]])
     def test_sources_come_in_the_requested_dtype(self, source):
         """
@@ -476,11 +484,20 @@ class TestRadialPoissonSolver(unittest.TestCase):
             inp, _ = dataset[0]
             # the ball is the nodes with a nonzero input, out to its radius
             radius = r[inp[:, 0, 0] != 0].max().item()
-            self.assertTrue(support[0] <= radius <= support[1], f"ball radius {radius} outside {support}")
+            # up to a rounding of the node on the bound
+            self.assertTrue(support[0] * (1 - 1e-12) <= radius <= support[1] * (1 + 1e-12), f"ball radius {radius} outside {support}")
 
         with self.assertRaisesRegex(ValueError, "support"):
             # between the nodes 1.0 and 1.33 of the grid
             RadialPoissonDataset(grid, source="ball", support=(1.05, 1.1))
+
+    def test_dataset_ball_support_keeps_the_nodes_on_its_bounds(self):
+        """A node meant to sit on a bound of the support is a ball radius, though computing it may put it a rounding outside."""
+        grid = make_solver(33, rmin=1e-1).grid
+        r = grid.radial.r
+        # every 8th node is a power of ten, computed as exp of a linspace in log r
+        dataset = RadialPoissonDataset(grid, source="ball", support=(1.0, 10.0))
+        self.assertEqual(dataset.ball_nodes.tolist(), list(range(8, 17)), f"nodes {r[7:18].tolist()}")
 
     def test_move_to_a_device_without_float64(self):
         """
