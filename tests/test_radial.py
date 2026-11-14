@@ -248,6 +248,21 @@ class TestSphericalProductGrid(unittest.TestCase):
         expected = (shells * self.radial.volume_weights.to(torch.float32)).sum(-1)
         self.assertTrue(torch.allclose(th.QuadratureVolume(self.grid)(x), expected, rtol=1e-5, atol=1e-5))
 
+    @parameterized.expand([[0.0], [1.0], [3.0]])
+    def test_volume_quadrature_with_a_radial_power(self, radial_power):
+        """With the measure r^p dr, ones integrate to 4 pi (b^(p+1) - a^(p+1)) / (p+1); Gauss with nr = 4 integrates r^3 exactly."""
+        grid = SphericalProductGrid(self.angular, LegendreGaussRadialGrid(nr=4, r_inner=1.0, r_outer=2.0))
+        ones = torch.ones(grid.shape, dtype=torch.float64)
+        integral = th.QuadratureVolume(grid, radial_power=radial_power)(ones)
+        expected = 4.0 * math.pi * (2.0 ** (radial_power + 1) - 1.0) / (radial_power + 1)
+        self.assertAlmostEqual(integral.item() / expected, 1.0, places=12)
+        self.assertAlmostEqual(th.QuadratureVolume(grid, normalize=True, radial_power=radial_power)(ones).item(), 1.0, places=12)
+
+    def test_volume_quadrature_defaults_to_the_volume_weights(self):
+        """The default measure is the volume element, with the grid's volume weights themselves rather than r^2 w recomputed."""
+        self.assertTrue(torch.equal(th.QuadratureVolume(self.grid).radial_weight, self.radial.volume_weights))
+        self.assertTrue(torch.equal(th.QuadratureVolume(self.grid, radial_power=2).radial_weight, self.radial.volume_weights))
+
     def test_volume_quadrature_needs_a_product(self):
         with self.assertRaisesRegex(TypeError, "SphericalProductGrid"):
             th.QuadratureVolume(self.angular)

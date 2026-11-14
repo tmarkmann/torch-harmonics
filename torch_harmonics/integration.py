@@ -46,7 +46,7 @@ import torch.nn as nn
 
 from torch_harmonics._field_contract import check_field
 from torch_harmonics.grid import PointSetS2, _rejects_legacy_signature, require_point_set
-from torch_harmonics.radial import SphericalProductGrid, split_radial
+from torch_harmonics.radial import SphericalProductGrid, _radial_measure_weights, split_radial
 from torch_harmonics.utils import recast_buffers_for
 
 
@@ -231,13 +231,20 @@ class QuadratureVolume(QuadratureS2):
     :class:`~torch_harmonics.radial.GeometricRadialGrid` integrates over its nodes' range
     ``[r_min, r_max]`` only, leaving the rest of an unbounded or exterior domain unsampled.
 
+    With ``radial_power`` :math:`p`, the radial measure is :math:`r^p \, dr` instead of the
+    volume element :math:`r^2 \, dr`: :math:`p = 0` integrates :math:`\int \int f \, d\Omega \, dr`,
+    e.g. for a norm that weights every radius alike.
+
     Parameters
     ----------
     grid : SphericalProductGrid
         The product of the angular grid and the radial grid to integrate on.
     normalize : bool, optional
-        If ``True``, divides by the volume the weights integrate, :math:`4\pi \sum_k r_k^2 w_k`,
-        to return the volume average instead of the integral, by default ``False``.
+        If ``True``, divides by the measure of the domain, :math:`4\pi \sum_k r_k^p w_k`, to
+        return the average instead of the integral, by default ``False``.
+    radial_power : float, optional
+        Power :math:`p` of the radial measure :math:`r^p \, dr`, by default 2.0, the volume
+        element.
 
     Examples
     --------
@@ -254,7 +261,7 @@ class QuadratureVolume(QuadratureS2):
     #: no pre-v1.0.0 signature to reject; see test_every_grid_taking_constructor_rejects_the_old_signature
     _legacy_signature_exempt = "new in v1.0.0rc1"
 
-    def __init__(self, grid: SphericalProductGrid, normalize: Optional[bool] = False):
+    def __init__(self, grid: SphericalProductGrid, normalize: Optional[bool] = False, radial_power: Optional[float] = 2.0):
         if not isinstance(grid, SphericalProductGrid):
             raise TypeError(f"grid must be a SphericalProductGrid; for the integral over the sphere alone use QuadratureS2. Got {grid!r}.")
 
@@ -262,9 +269,8 @@ class QuadratureVolume(QuadratureS2):
         # below then complete either the integral or the volume average
         super().__init__(grid, normalize=normalize)
 
-        radial_weight = self.radial.volume_weights
-        if normalize:
-            radial_weight = radial_weight / radial_weight.sum()
+        self.radial_power = radial_power
+        radial_weight = _radial_measure_weights(self.radial, radial_power, normalize=normalize)
         # kept in float64: r^2 w spans the cube of the radial range, which leaves float32's
         # range on astrophysical radii in SI units, and in the other direction on tiny ones.
         # Cast at use, so a float64 field integrates in float64

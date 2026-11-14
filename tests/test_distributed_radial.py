@@ -225,6 +225,15 @@ class TestDistributedLayersOnProductGrids(unittest.TestCase):
         expected = (shells(x) * _RADIAL.volume_weights.to(device=self.device, dtype=torch.float32)).sum(-1)
         self.assertTrue(_close("volume integral", quad(x), expected))
 
+    def test_volume_quadrature_with_a_radial_power(self):
+        """With radial_power 0 the shells are summed against the plain dr weights."""
+        grid = SphericalProductGrid(_GRID, _RADIAL)
+        quad = thd.DistributedQuadratureVolume(grid, radial_power=0.0).to(self.device)
+        shells = thd.DistributedQuadratureS2(grid).to(self.device)
+        x = _local_randn((2, _RADIAL.nr, *quad.shard.shape), self.device).detach()
+        expected = (shells(x) * _RADIAL.quad_weights.to(device=self.device, dtype=torch.float32)).sum(-1)
+        self.assertTrue(_close("integral in r^0 dr", quad(x), expected))
+
     def test_volume_quadrature_of_one_is_the_volume(self):
         grid = SphericalProductGrid(_GRID, _RADIAL)
         quad = thd.DistributedQuadratureVolume(grid).to(self.device)

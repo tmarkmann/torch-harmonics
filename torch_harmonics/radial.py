@@ -475,6 +475,22 @@ class SphericalProductGrid:
         return SphericalProductGrid(PointSetS2.from_dict(data["angular"]), RadialGrid.from_dict(data["radial"]))
 
 
+def _radial_measure_weights(radial: RadialGrid, radial_power: float = 2.0, normalize: bool = False) -> torch.Tensor:
+    r"""
+    Weights for :math:`\int f(r)\, r^p\, dr` on ``radial``, shape ``(nr,)``, in float64.
+
+    :math:`p = 2` is the volume element, and returns the grid's
+    :attr:`~RadialGrid.volume_weights` themselves. With ``normalize`` the weights sum to one.
+    """
+    if radial_power == 2.0:
+        weight = radial.volume_weights
+    else:
+        weight = radial.quad_weights * radial.r**radial_power
+    if normalize:
+        weight = weight / weight.sum()
+    return weight
+
+
 def split_radial(grid: Any) -> Tuple[Any, Optional[RadialGrid]]:
     """
     ``(angular, radial)`` of a product, ``(grid, None)`` of anything else.

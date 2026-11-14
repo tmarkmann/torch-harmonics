@@ -35,7 +35,7 @@ import torch
 
 from torch_harmonics._field_contract import check_field
 from torch_harmonics.grid import GridS2, RegularGridShardS2, _rejects_legacy_signature, require_grid
-from torch_harmonics.radial import SphericalProductGrid, split_radial
+from torch_harmonics.radial import SphericalProductGrid, _radial_measure_weights, split_radial
 from torch_harmonics.utils import recast_buffers_for
 
 from .primitives import reduce_from_azimuth_region, reduce_from_polar_region
@@ -174,20 +174,22 @@ class DistributedQuadratureVolume(DistributedQuadratureS2):
         The product of the *global* angular grid and the radial grid.
     normalize : bool, optional
         If ``True``, returns the volume average instead of the integral, by default ``False``.
+    radial_power : float, optional
+        Power :math:`p` of the radial measure :math:`r^p \, dr`, by default 2.0, the volume
+        element.
     """
 
     #: no pre-v1.0.0 signature to reject; see test_every_grid_taking_constructor_rejects_the_old_signature
     _legacy_signature_exempt = "new in v1.0.0rc1"
 
-    def __init__(self, grid: SphericalProductGrid, normalize: Optional[bool] = False):
+    def __init__(self, grid: SphericalProductGrid, normalize: Optional[bool] = False, radial_power: Optional[float] = 2.0):
         if not isinstance(grid, SphericalProductGrid):
             raise TypeError(f"grid must be a SphericalProductGrid; for the integral over the sphere alone use DistributedQuadratureS2. Got {grid!r}.")
 
         super().__init__(grid, normalize=normalize)
 
-        radial_weight = self.radial.volume_weights
-        if normalize:
-            radial_weight = radial_weight / radial_weight.sum()
+        self.radial_power = radial_power
+        radial_weight = _radial_measure_weights(self.radial, radial_power, normalize=normalize)
         # kept in float64: r^2 w spans the cube of the radial range, which leaves float32's
         # range on astrophysical radii in SI units, and in the other direction on tiny ones.
         # Cast at use, so a float64 field integrates in float64
